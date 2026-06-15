@@ -72,20 +72,20 @@ defmodule MyApp.Workflows.OrderApproval do
     map :order_id, from: [:order_id]
     map :ordered_at, from: [:ordered_at]
   end
+
+  automation :approve_order_when_submitted_again do
+    on {MyApp.Workflows.OrderSubmission, :order_submitted}
+    idempotency_key [:order_id]
+    run :approve_order
+
+    map :order_id, from: [:order_id]
+    map :ordered_at, from: [:ordered_at]
+  end
 end
 
-Shigoto.IR.build(MyApp.Workflows.OrderApproval)
-|> IO.inspect()
-
-Shigoto.Multi.new(
+dot = 
+Shigoto.Export.Mermaid.workflow(
   MyApp.Workflows.OrderApproval,
-  :approve_order,
-  %{
-    order_id: "1234",
-    ordered_at: ~U[2023-01-01 12:00:00Z]
-  },
-  emit: fn _repo, _changes, event, payload ->
-    MyApp.Outbox.enqueue_event(event, payload)
-  end
+  :approve_order
 )
-|> IO.inspect()
+File.write!("approve_order.mermaid", dot)

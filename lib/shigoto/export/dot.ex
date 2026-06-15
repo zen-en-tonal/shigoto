@@ -1,6 +1,6 @@
-defmodule Shigoto.Export.Mermaid do
+defmodule Shigoto.Export.DOT do
   @moduledoc """
-  Exports Shigoto workflows as Mermaid flowcharts.
+  Exports Shigoto workflows as Graphviz DOT.
 
   The default output is intended for non-programmers.
 
@@ -21,20 +21,15 @@ defmodule Shigoto.Export.Mermaid do
     * `produces`
     * MFA calls
     * payload mappings
-
-  The output is a Mermaid `flowchart` diagram.
   """
 
   @doc """
-  Exports a workflow as a Mermaid flowchart.
+  Exports a workflow as Graphviz DOT.
 
   ## Options
 
-    * `:direction` - Mermaid flowchart direction. Defaults to `"TD"`.
+    * `:rankdir` - Graphviz rank direction. Defaults to `"TB"`.
       Use `"LR"` for left-to-right diagrams.
-
-    * `:rankdir` - DOT-compatible alias for `:direction`.
-      Used only when `:direction` is not provided.
 
     * `:show_inputs?` - whether to render workflow inputs. Defaults to `false`.
 
@@ -47,15 +42,14 @@ defmodule Shigoto.Export.Mermaid do
     * `:show_map_edges?` - whether to show event payload mapping edges.
       Defaults to `false`.
 
-    * `:title?` - whether to include the workflow title as a Mermaid comment.
-      Defaults to `true`.
+    * `:graph_name` - custom DOT graph name.
 
   ## Example
 
-      Shigoto.Export.Mermaid.workflow(
+      Shigoto.Export.DOT.workflow(
         MyApp.Workflows.OrderApproval,
         :approve_order,
-        direction: "LR"
+        rankdir: "LR"
       )
 
   """
@@ -64,16 +58,18 @@ defmodule Shigoto.Export.Mermaid do
     automations = automations_for_workflow(module, workflow_name)
     graph = Shigoto.Graph.workflow_graph(workflow)
 
-    direction =
-      opts
-      |> Keyword.get(:direction, Keyword.get(opts, :rankdir, "TD"))
-      |> normalize_direction()
+    graph_name =
+      Keyword.get(
+        opts,
+        :graph_name,
+        "#{inspect(module)}.#{workflow_name}"
+      )
 
+    rankdir = Keyword.get(opts, :rankdir, "TB")
     show_inputs? = Keyword.get(opts, :show_inputs?, false)
     show_technical_labels? = Keyword.get(opts, :show_technical_labels?, false)
     show_calls? = Keyword.get(opts, :show_calls?, false)
     show_map_edges? = Keyword.get(opts, :show_map_edges?, false)
-    title? = Keyword.get(opts, :title?, true)
 
     node_index = node_index(workflow)
 
@@ -86,26 +82,31 @@ defmodule Shigoto.Export.Mermaid do
       graph.edges
       |> Enum.filter(&business_edge?(&1, show_map_edges?))
 
-    entry_vertices = entry_vertices(graph, business_edges)
+    entry_vertices =
+      entry_vertices(graph, business_edges)
 
     [
-      "flowchart #{direction}",
-      maybe_title(module, workflow, title?),
+      "digraph #{quoted(graph_name)} {",
+      indent("graph [rankdir=#{quoted(rankdir)}, splines=ortho, overlap=false];"),
+      indent("node [fontname=#{quoted("Helvetica")}, fontsize=10, margin=0.08];"),
+      indent("edge [fontname=#{quoted("Helvetica")}, fontsize=9];"),
       "",
-      class_defs(),
+      indent("label=#{quoted(workflow_title(module, workflow))};"),
+      indent("labelloc=#{quoted("t")};"),
+      indent("fontsize=16;"),
       "",
-      automation_nodes_and_edges(module, workflow, automations),
+      automation_nodes_and_edges(module, workflow, automations, entry_vertices),
       maybe_input_nodes(workflow, show_inputs?),
-      workflow_subgraph(
+      maybe_input_edges(workflow, show_inputs?),
+      workflow_cluster(
         module,
         workflow,
         vertices,
         node_index,
         show_calls?
       ),
-      start_edges(workflow, entry_vertices),
-      maybe_input_edges(workflow, show_inputs?),
-      edge_lines(business_edges, show_technical_labels?)
+      edge_lines(business_edges, show_technical_labels?),
+      "}"
     ]
     |> List.flatten()
     |> Enum.reject(&(&1 == nil or &1 == ""))
@@ -133,73 +134,68 @@ defmodule Shigoto.Export.Mermaid do
     |> Enum.filter(&(&1.run == workflow_name))
   end
 
-  defp maybe_title(_module, _workflow, false), do: nil
-
-  defp maybe_title(module, workflow, true) do
-    indent("%% #{workflow_title(module, workflow)}")
-  end
-
   defp workflow_title(module, workflow) do
     "#{humanize_module(module)} / #{humanize(workflow.name)}"
   end
 
-  defp workflow_subgraph(_module, workflow, vertices, node_index, show_calls?) do
+  defp workflow_cluster(_module, workflow, vertices, node_index, show_calls?) do
     [
-      indent("subgraph #{mermaid_id("cluster:#{workflow.name}")}[") <>
-        mermaid_label("Workflow: #{humanize(workflow.name)}") <> "]",
-      mermaid_node_raw(start_vertex(workflow),
-        label: "開始",
-        shape: "oval",
-        class: "start"
+      indent("subgraph #{quoted("cluster_#{workflow.name}")} {"),
+      indent2("label=#{quoted("Workflow: #{humanize(workflow.name)}")};"),
+      indent2("style=#{quoted("rounded")};"),
+      indent2("color=#{quoted("gray70")};"),
+      indent2(
+        "workflow_start_#{workflow.name} [label=#{quoted("開始")}, shape=oval, style=#{quoted("filled,rounded")}, fillcolor=#{quoted("gray95")}, color=#{quoted("gray60")}];"
       ),
       "",
       vertices
       |> Enum.map(fn vertex ->
         case Map.fetch(node_index, vertex) do
           {:ok, {:assert, assertion}} ->
-            mermaid_node(vertex,
+            dot_node(vertex,
               label: assertion_label(assertion),
               shape: "hexagon",
-              class: "assertion"
+              style: "rounded",
+              fillcolor: "gray95"
             )
 
           {:ok, {:task, task}} ->
-            mermaid_node(vertex,
+            dot_node(vertex,
               label: task_label(task, show_calls?),
               shape: task_shape(task),
-              class: "task"
+              style: "rounded"
             )
 
           {:ok, {:decision, decision}} ->
-            mermaid_node(vertex,
+            dot_node(vertex,
               label: decision_label(decision),
               shape: "diamond",
-              class: "decision"
+              style: "rounded"
             )
 
           {:ok, {:emit, {emit, _index}}} ->
-            mermaid_node(vertex,
+            dot_node(vertex,
               label: emit_label(emit),
               shape: "ellipse",
-              class: "event"
+              style: "rounded"
             )
 
           :error ->
-            mermaid_node(vertex,
+            dot_node(vertex,
               label: humanize(vertex),
               shape: "box",
-              class: "task"
+              style: "rounded"
             )
         end
       end),
-      indent("end")
+      indent("}")
     ]
   end
 
-  defp automation_nodes_and_edges(_module, _workflow, []), do: []
+  defp automation_nodes_and_edges(_module, _workflow, [], _entry_vertices), do: []
 
-  defp automation_nodes_and_edges(_module, workflow, automations) do
-    start_vertex = start_vertex(workflow)
+  defp automation_nodes_and_edges(_module, workflow, automations, entry_vertices) do
+    start_vertex = "workflow_start_#{workflow.name}"
 
     automations
     |> Enum.with_index()
@@ -208,28 +204,23 @@ defmodule Shigoto.Export.Mermaid do
       event_id = event_vertex(automation.on, index)
 
       [
-        mermaid_node_raw(event_id,
+        dot_node_raw(event_id,
           label: trigger_event_label(automation.on),
           shape: "ellipse",
-          class: "event"
+          style: "rounded"
         ),
-        mermaid_node_raw(automation_id,
+        dot_node_raw(automation_id,
           label: automation_label(automation),
           shape: "box",
-          class: "automation"
+          style: "rounded,filled",
+          fillcolor: "gray95"
         ),
-        mermaid_edge_raw(event_id, automation_id, label: "トリガー"),
-        mermaid_edge_raw(automation_id, start_vertex, label: "開始")
-      ]
-    end)
-  end
-
-  defp start_edges(workflow, entry_vertices) do
-    start_vertex = start_vertex(workflow)
-
-    entry_vertices
-    |> Enum.map(fn entry ->
-      mermaid_edge_raw(start_vertex, vertex_id(entry), [])
+        dot_edge_raw(event_id, automation_id, label: "トリガー"),
+        dot_edge_raw(automation_id, start_vertex, label: "開始")
+      ] ++
+        Enum.map(entry_vertices, fn entry ->
+          dot_edge_raw(start_vertex, vertex_id(entry), [])
+        end)
     end)
   end
 
@@ -239,10 +230,10 @@ defmodule Shigoto.Export.Mermaid do
     workflow.inputs
     |> list()
     |> Enum.map(fn input ->
-      mermaid_node(input_vertex(input.name),
+      dot_node(input_vertex(input.name),
         label: "#{humanize(input.name)}\n#{input.type}",
         shape: "parallelogram",
-        class: "input"
+        style: "rounded"
       )
     end)
   end
@@ -260,7 +251,7 @@ defmodule Shigoto.Export.Mermaid do
       |> Enum.filter(&MapSet.member?(input_names, &1))
       |> Enum.reject(&Map.has_key?(producer_by_value, &1))
       |> Enum.map(fn input_name ->
-        mermaid_edge(input_vertex(input_name), target_vertex, style: "dashed")
+        dot_edge(input_vertex(input_name), target_vertex, style: "dashed")
       end)
     end)
   end
@@ -272,7 +263,7 @@ defmodule Shigoto.Export.Mermaid do
     end)
     |> Enum.map(fn edge ->
       attrs = business_edge_attrs(edge, show_technical_labels?)
-      mermaid_edge(edge.from, edge.to, attrs)
+      dot_edge(edge.from, edge.to, attrs)
     end)
     |> Enum.reject(&is_nil/1)
   end
@@ -341,7 +332,8 @@ defmodule Shigoto.Export.Mermaid do
       |> Enum.map(& &1.to)
       |> MapSet.new()
 
-    entries = MapSet.difference(vertices, incoming)
+    entries =
+      MapSet.difference(vertices, incoming)
 
     if MapSet.size(entries) == 0 do
       vertices
@@ -510,8 +502,6 @@ defmodule Shigoto.Export.Mermaid do
 
   defp format_workflow_ref(other), do: inspect(other)
 
-  defp start_vertex(workflow), do: "workflow_start:#{workflow.name}"
-
   defp input_vertex(input_name), do: {:input, input_name}
 
   defp automation_vertex(automation, index) do
@@ -522,110 +512,37 @@ defmodule Shigoto.Export.Mermaid do
     "trigger_event:#{inspect(event)}:#{index}"
   end
 
-  defp mermaid_node(vertex, attrs) do
-    mermaid_node_raw(vertex_id(vertex), attrs)
+  defp dot_node(vertex, attrs) do
+    dot_node_raw(vertex_id(vertex), attrs)
   end
 
-  defp mermaid_node_raw(id_key, attrs) do
-    label = attrs |> Keyword.fetch!(:label) |> mermaid_label()
-    shape = Keyword.get(attrs, :shape, "box")
-    class = Keyword.get(attrs, :class)
-
-    indent("#{mermaid_id(id_key)}#{mermaid_shape(label, shape)}#{class_suffix(class)}")
+  defp dot_node_raw(id, attrs) do
+    indent("#{quoted(id)} [#{dot_attrs(attrs)}];")
   end
 
-  defp mermaid_edge(_from, _to, []), do: nil
-
-  defp mermaid_edge(from, to, attrs) do
-    mermaid_edge_raw(vertex_id(from), vertex_id(to), attrs)
+  defp dot_edge(_from, _to, []) do
+    nil
   end
 
-  defp mermaid_edge_raw(from, to, attrs) do
-    from_id = mermaid_id(from)
-    to_id = mermaid_id(to)
-    style = Keyword.get(attrs, :style, "solid")
-    label = Keyword.get(attrs, :label)
-    arrow = mermaid_arrow(style)
-
-    edge =
-      if is_nil(label) do
-        "#{from_id} #{arrow} #{to_id}"
-      else
-        "#{from_id} #{arrow}|#{mermaid_edge_label(label)}| #{to_id}"
-      end
-
-    indent(edge)
+  defp dot_edge(from, to, attrs) do
+    dot_edge_raw(vertex_id(from), vertex_id(to), attrs)
   end
 
-  defp mermaid_shape(label, "diamond"), do: "{#{label}}"
-  defp mermaid_shape(label, "hexagon"), do: "{{#{label}}}"
-  defp mermaid_shape(label, "ellipse"), do: "((#{label}))"
-  defp mermaid_shape(label, "oval"), do: "([#{label}])"
-  defp mermaid_shape(label, "parallelogram"), do: "[/#{label}/]"
-  defp mermaid_shape(label, "component"), do: "[[#{label}]]"
-  defp mermaid_shape(label, _shape), do: "[#{label}]"
-
-  defp mermaid_arrow("bold"), do: "==>"
-  defp mermaid_arrow("dashed"), do: "-.->"
-  defp mermaid_arrow("dotted"), do: "-.->"
-  defp mermaid_arrow(_style), do: "-->"
-
-  defp class_suffix(nil), do: ""
-  defp class_suffix(class), do: ":::#{class}"
-
-  defp class_defs do
-    [
-      indent("classDef start fill:#f5f5f5,stroke:#999,stroke-width:1px;"),
-      indent("classDef automation fill:#f8f8f8,stroke:#999,stroke-width:1px;"),
-      indent("classDef input fill:#fff,stroke:#999,stroke-dasharray:3 3;"),
-      indent("classDef assertion fill:#f8f8f8,stroke:#999,stroke-width:1px;"),
-      indent("classDef task fill:#fff,stroke:#555,stroke-width:1px;"),
-      indent("classDef decision fill:#fff,stroke:#555,stroke-width:1px;"),
-      indent("classDef event fill:#fff,stroke:#777,stroke-width:1px;")
-    ]
-  end
-
-  defp mermaid_id(value) do
-    raw = to_string(value)
-
-    base =
-      raw
-      |> String.replace(~r/[^a-zA-Z0-9_]/, "_")
-      |> String.trim("_")
-      |> String.slice(0, 48)
-
-    hash =
-      :crypto.hash(:sha256, raw)
-      |> Base.encode16(case: :lower)
-      |> binary_part(0, 10)
-
-    case base do
-      "" -> "n_#{hash}"
-      base -> "n_#{base}_#{hash}"
+  defp dot_edge_raw(from, to, attrs) do
+    if attrs == [] do
+      indent("#{quoted(from)} -> #{quoted(to)};")
+    else
+      indent("#{quoted(from)} -> #{quoted(to)} [#{dot_attrs(attrs)}];")
     end
   end
 
-  defp mermaid_label(value) do
-    escaped =
-      value
-      |> to_string()
-      |> String.replace("&", "&amp;")
-      |> String.replace("\"", "&quot;")
-      |> String.replace("<", "&lt;")
-      |> String.replace(">", "&gt;")
-      |> String.replace("\n", "<br/>")
-
-    "\"#{escaped}\""
-  end
-
-  defp mermaid_edge_label(value) do
-    value
-    |> to_string()
-    |> String.replace("&", "&amp;")
-    |> String.replace("|", "&#124;")
-    |> String.replace("<", "&lt;")
-    |> String.replace(">", "&gt;")
-    |> String.replace("\n", " ")
+  defp dot_attrs(attrs) do
+    attrs
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Enum.map(fn {key, value} ->
+      "#{key}=#{quoted(to_string(value))}"
+    end)
+    |> Enum.join(", ")
   end
 
   defp vertex_id({:emit, workflow_name, event_name, index}) do
@@ -642,6 +559,17 @@ defmodule Shigoto.Export.Mermaid do
 
   defp vertex_id(value) do
     inspect(value)
+  end
+
+  defp quoted(value) do
+    escaped =
+      value
+      |> to_string()
+      |> String.replace("\\", "\\\\")
+      |> String.replace("\"", "\\\"")
+      |> String.replace("\n", "\\n")
+
+    "\"#{escaped}\""
   end
 
   defp humanize(value) when is_atom(value) do
@@ -665,18 +593,12 @@ defmodule Shigoto.Export.Mermaid do
     |> List.last()
   end
 
-  defp normalize_direction("TB"), do: "TD"
-  defp normalize_direction("BT"), do: "BT"
-  defp normalize_direction("LR"), do: "LR"
-  defp normalize_direction("RL"), do: "RL"
-  defp normalize_direction("TD"), do: "TD"
-  defp normalize_direction(_direction), do: "TD"
-
   defp sort_terms(values) do
     Enum.sort_by(values, &vertex_id/1)
   end
 
   defp indent(line), do: "  " <> line
+  defp indent2(line), do: "    " <> line
 
   defp list(nil), do: []
   defp list(value) when is_list(value), do: value
