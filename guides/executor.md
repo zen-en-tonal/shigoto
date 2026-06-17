@@ -2,16 +2,16 @@
 
 `Shigoto.Executor` is the primary runtime for Shigoto workflows. It evaluates
 all workflow nodes as plain Elixir function calls outside any database
-transaction, accumulates `persists` values into an `Ecto.Multi`, and returns
-everything to the caller.
+transaction, accumulates `persists` values into an `Ecto.Multi`, collects
+`emit` payloads, and returns everything to the caller.
 
 ```
-{:ok, context, persist_multi} | {:error, reason, partial_context}
+{:ok, context, persist_multi, emits} | {:error, reason, partial_context, partial_emits}
 ```
 
-The caller is responsible for committing `persist_multi`. This design keeps
-domain logic free of transaction concerns and makes transaction boundaries
-explicit at the call site.
+The caller is responsible for committing `persist_multi` and dispatching
+`emits`. This design keeps domain logic free of transaction and messaging
+concerns and makes those boundaries explicit at the call site.
 
 ## Entry points
 
@@ -20,7 +20,7 @@ explicit at the call site.
 Run a named workflow directly.
 
 ```elixir
-{:ok, ctx, persist_multi} =
+{:ok, ctx, persist_multi, emits} =
   Shigoto.Executor.run(
     MyApp.Workflows.OrderApproval,  # module
     :approve_order,                  # workflow name
@@ -35,7 +35,7 @@ Run a workflow via an automation, mapping the event payload through the
 automation's `map` declarations.
 
 ```elixir
-{:ok, ctx, persist_multi} =
+{:ok, ctx, persist_multi, emits} =
   Shigoto.Executor.run_automation(
     MyApp.Workflows.OrderApproval,
     :on_order_submitted,
@@ -51,7 +51,7 @@ struct yourself.
 
 ```elixir
 [workflow] = Shigoto.Info.workflows(MyApp.Workflows.OrderApproval)
-{:ok, ctx, persist_multi} = Shigoto.Executor.run_workflow(workflow, inputs, opts)
+{:ok, ctx, persist_multi, emits} = Shigoto.Executor.run_workflow(workflow, inputs, opts)
 ```
 
 ## Options
@@ -59,22 +59,25 @@ struct yourself.
 | Option | Type | Description |
 |---|---|---|
 | `:repo` | any | Passed to domain functions that declare `:repo` in their arg spec. Not used to open a transaction. |
-| `:emit` | callback | Called for each `emit` node after all tasks complete. See [Emit callbacks](#emit-callbacks). |
 | `:module` | module | Current workflow module. Set automatically by `run/4`. |
 | `:workflow_resolver` | `fn module, name -> {module, workflow}` | Override how sub-workflow names are resolved. |
 
 ## Return values
 
-**`{:ok, context, persist_multi}`** — all nodes succeeded.
+**`{:ok, context, persist_multi, emits}`** — all nodes succeeded.
 
 - `context` is a plain `%{atom() => term()}` map containing every produced value
   and decision result.
 - `persist_multi` is an `Ecto.Multi` ready for `Repo.transaction/2`. It is
   empty (`Ecto.Multi.new()`) when no `persists` are declared.
+- `emits` is a list of `{event_ref, payload}` tuples in topological order.
+  `event_ref` is `:event_name` for local events or `{module, :event_name}` for
+  cross-module references.
 
-**`{:error, reason, partial_context}`** — a node failed.
+**`{:error, reason, partial_context, partial_emits}`** — a node failed.
 
 - `partial_context` holds everything accumulated up to the failure point.
+- `partial_emits` holds any emit payloads collected before the failure.
 
 ### Error reasons
 
@@ -84,23 +87,20 @@ struct yourself.
 | `{:task_failed, name, reason}` | Task returned `{:error, reason}` |
 | `{:task_raised, name, exception}` | Task raised an exception |
 | `{:unknown_branch, name, branch}` | Decision returned an atom not in `branches` |
-| `{:emit_failed, event, reason}` | Emit callback returned `{:error, reason}` |
 
 ## Execution model
 
 1. **Seed** — declared `input` values are placed in the context.
 2. **Topological sort** — nodes are ordered by their dependency graph.
 3. **Walk** — each node is executed in dependency order, carrying
-   `{context, skip_set, persist_multi}`:
+   `{context, skip_set, persist_multi, emits}`:
    - `:assert` — calls `evaluated_by`; aborts on falsy result.
    - `:task` (function) — calls `call`; stores `produces` value in context.
-   - `:task` (sub-workflow) — recursively calls `run_workflow`; merges sub-multi.
+   - `:task` (sub-workflow) — recursively calls `run_workflow`; merges sub-multi and sub-emits.
    - `:decision` — calls `evaluated_by`; stores branch atom; adds non-taken
      branch descendants to the skip set.
-   - `:emit` — deferred; collected for post-walk dispatch.
-4. **Emit dispatch** — emit callbacks are called with the final context, in
-   topological order.
-5. **Return** — `{:ok, context, persist_multi}`.
+   - `:emit` — builds payload from `map` declarations; appended to emits list.
+4. **Return** — `{:ok, context, persist_multi, emits}`.
 
 Nodes in the skip set are never evaluated. Their produces values never appear
 in the context, and their `persists` values are never accumulated.
@@ -149,62 +149,43 @@ Domain functions may return:
 | `{:error, reason}` | Failure; workflow aborts |
 | Any other value | Success; the value itself stored under `produces` |
 
-## Emit callbacks
+## Handling emits
 
-Pass an emit callback via the `:emit` option. It is called once per `emit` node,
-after all workflow tasks complete, with the final execution context.
-
-The callback receives different arguments depending on its arity:
-
-| Arity | Signature |
-|---|---|
-| 1 | `callback.(payload)` |
-| 2 | `callback.(event, payload)` |
-| 3 | `callback.(repo, event, payload)` |
-| 4 | `callback.(repo, context, event, payload)` |
-| 5 | `callback.(repo, context, event, payload, emit_node)` |
-
-`event` is `{module, :event_name}` when the module is known.  
-`payload` is a map built from the `emit`'s `map` declarations.
-
-MFA form with extra args is also supported:
+After a workflow run, `emits` is a list of `{event_ref, payload}` tuples — one
+per `emit` node that was reached. The caller decides what to do with them:
 
 ```elixir
-Shigoto.Executor.run(module, :wf, inputs,
-  emit: {MyApp.Events, :publish, [exchange: "domain"]},
-  repo: MyApp.Repo
-)
-# → MyApp.Events.publish(repo, context, event, payload, exchange: "domain")
+{:ok, ctx, persist_multi, emits} = Shigoto.Executor.run(...)
+
+# Commit DB changes and record outbox entries atomically
+outbox_multi =
+  Enum.reduce(emits, persist_multi, fn {event, payload}, m ->
+    cs = OutboxEntry.changeset(%OutboxEntry{}, %{event: inspect(event), payload: payload})
+    Ecto.Multi.insert(m, {:outbox, event}, cs)
+  end)
+
+{:ok, _} = MyApp.Repo.transaction(outbox_multi)
 ```
 
-### Example — outbox pattern
+Use `Shigoto.Automation` to route emits to matching automations:
 
 ```elixir
-defmodule MyApp.EventPublisher do
-  def publish(repo, _ctx, event, payload) do
-    %MyApp.OutboxEntry{}
-    |> MyApp.OutboxEntry.changeset(%{event: inspect(event), payload: payload})
-    |> repo.insert()
-    |> case do
-      {:ok, _} -> :ok
-      {:error, cs} -> {:error, cs}
-    end
-  end
-end
+index = Shigoto.Automation.index([MyApp.OrderWorkflows, MyApp.PaymentWorkflows])
 
-{:ok, ctx, persist_multi} =
-  Shigoto.Executor.run(module, :wf, inputs,
-    emit: {MyApp.EventPublisher, :publish, 4},
-    repo: MyApp.Repo
-  )
+{:ok, _ctx, persist_multi, emits} = Shigoto.Executor.run(...)
+{:ok, _} = MyApp.Repo.transaction(persist_multi)
+
+Shigoto.Automation.dispatch_all(index, emits, repo: MyApp.Repo)
 ```
+
+See [Automation](automation.md) for the full dispatch API.
 
 ## Committing persists
 
 `persist_multi` is a plain `Ecto.Multi` — pass it to your repo:
 
 ```elixir
-{:ok, ctx, persist_multi} = Shigoto.Executor.run(...)
+{:ok, ctx, persist_multi, _emits} = Shigoto.Executor.run(...)
 
 case MyApp.Repo.transaction(persist_multi) do
   {:ok, _results} -> {:ok, ctx}
@@ -223,10 +204,9 @@ Pass stub domain modules directly — no mocks or adapters required:
 test "approval path persists approved order" do
   inputs = %{order_id: "order-1", ordered_at: DateTime.utc_now()}
 
-  assert {:ok, ctx, persist_multi} =
+  assert {:ok, ctx, persist_multi, _emits} =
            Shigoto.Executor.run(MyApp.Workflows.OrderApproval, :approve_order, inputs,
-             repo: Ecto.Adapters.SQL.Sandbox,
-             emit: fn _event, _payload -> :ok end
+             repo: Ecto.Adapters.SQL.Sandbox
            )
 
   assert ctx.approval_required == :not_required

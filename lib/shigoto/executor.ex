@@ -6,23 +6,41 @@ if Code.ensure_loaded?(Ecto.Multi) do
     Evaluates all workflow nodes as plain function calls outside any DB
     transaction. `persists` changesets (including those from nested
     sub-workflows) are accumulated into an `Ecto.Multi` that is returned to
-    the caller. The caller is responsible for opening a transaction and
-    committing.
+    the caller. Emit payloads are similarly returned as a list — the caller
+    decides when and how to dispatch them.
 
     ## Usage
 
-        {:ok, context, persist_multi} =
+        {:ok, context, persist_multi, emits} =
           Shigoto.Executor.run(MyWorkflows, :approve_order, inputs, repo: MyRepo)
 
         {:ok, _results} = MyRepo.transaction(persist_multi)
+        Enum.each(emits, fn {event, payload} -> MyApp.Events.publish(event, payload) end)
+
+    ## Outbox pattern
+
+    Because emits are returned alongside the persist multi, you can add them to
+    the same DB transaction:
+
+        {:ok, _ctx, persist_multi, emits} = Executor.run(...)
+
+        outbox_multi =
+          Enum.reduce(emits, persist_multi, fn {event, payload}, m ->
+            cs = OutboxEntry.changeset(%OutboxEntry{}, %{event: inspect(event), payload: payload})
+            Ecto.Multi.insert(m, {:outbox, event}, cs)
+          end)
+
+        {:ok, _} = MyRepo.transaction(outbox_multi)
 
     ## Return values
 
-      * `{:ok, context, persist_multi}` — all nodes succeeded. `persist_multi`
-        is an `Ecto.Multi` containing only the `persists` changesets, ready for
-        `Repo.transaction/2`. It is empty (`Ecto.Multi.new()`) when no `persists`
-        are declared.
-      * `{:error, reason, partial_context}` — a node failed.
+      * `{:ok, context, persist_multi, emits}` — all nodes succeeded.
+        `persist_multi` is an `Ecto.Multi` ready for `Repo.transaction/2`
+        (empty when no `persists` are declared). `emits` is a list of
+        `{event_ref, payload}` tuples in topological order.
+      * `{:error, reason, partial_context, partial_emits}` — a node failed.
+        `partial_emits` contains payloads for any emit nodes that were reached
+        before the failure (their `after_node` sources had already succeeded).
 
     ## Error reasons
 
@@ -30,7 +48,6 @@ if Code.ensure_loaded?(Ecto.Multi) do
       * `{:task_failed, name, reason}` — task returned `{:error, reason}`
       * `{:task_raised, name, exception}` — task raised an exception
       * `{:unknown_branch, name, branch}` — decision returned an undeclared branch
-      * `{:emit_failed, event, reason}` — emit callback returned `{:error, reason}`
     """
 
     alias Ecto.Multi
@@ -39,18 +56,20 @@ if Code.ensure_loaded?(Ecto.Multi) do
     @type inputs :: map() | keyword()
     @type workflow_name :: atom()
 
+    @type emit_result :: {atom() | {module(), atom()}, map()}
+
     @type reason ::
             {:assertion_failed, atom()}
             | {:task_failed, atom(), term()}
             | {:task_raised, atom(), Exception.t()}
             | {:unknown_branch, atom(), atom()}
-            | {:emit_failed, atom() | {module(), atom()}, term()}
 
     @doc """
     Runs a named workflow and returns the execution context plus a persist Multi.
     """
     @spec run(module(), workflow_name(), inputs(), keyword()) ::
-            {:ok, context(), Ecto.Multi.t()} | {:error, reason(), context()}
+            {:ok, context(), Ecto.Multi.t(), [emit_result()]}
+            | {:error, reason(), context(), [emit_result()]}
     def run(module, workflow_name, inputs \\ %{}, opts \\ []) do
       workflow = fetch_workflow!(module, workflow_name)
       opts = Keyword.put_new(opts, :module, module)
@@ -64,7 +83,8 @@ if Code.ensure_loaded?(Ecto.Multi) do
     declarations, then delegates to `run_workflow/3`.
     """
     @spec run_automation(module(), atom(), map() | keyword(), keyword()) ::
-            {:ok, context(), Ecto.Multi.t()} | {:error, reason(), context()}
+            {:ok, context(), Ecto.Multi.t(), [emit_result()]}
+            | {:error, reason(), context(), [emit_result()]}
     def run_automation(module, automation_name, event_payload, opts \\ []) do
       automation = fetch_automation!(module, automation_name)
       workflow = fetch_workflow!(module, automation.run)
@@ -84,7 +104,8 @@ if Code.ensure_loaded?(Ecto.Multi) do
     Runs a workflow struct directly.
     """
     @spec run_workflow(struct(), inputs(), keyword()) ::
-            {:ok, context(), Ecto.Multi.t()} | {:error, reason(), context()}
+            {:ok, context(), Ecto.Multi.t(), [emit_result()]}
+            | {:error, reason(), context(), [emit_result()]}
     def run_workflow(workflow, inputs \\ %{}, opts \\ []) do
       context = seed_inputs!(workflow, inputs)
       execute_region(workflow, context, Multi.new(), opts)
@@ -115,7 +136,7 @@ if Code.ensure_loaded?(Ecto.Multi) do
               {:ok, {kind, node}} ->
                 case execute_node(kind, node, workflow, ctx, skip, multi, emits, persists_set, graph, opts) do
                   {:ok, new_state} -> {:cont, {:ok, new_state}}
-                  {:error, _, _} = err -> {:halt, err}
+                  {:error, _, _, _} = err -> {:halt, err}
                 end
 
               :error ->
@@ -126,13 +147,12 @@ if Code.ensure_loaded?(Ecto.Multi) do
 
       case final do
         {:ok, {final_ctx, _skip, final_multi, emit_jobs}} ->
-          case run_emit_jobs(Enum.reverse(emit_jobs), final_ctx, opts) do
-            {:ok, ctx_after} -> {:ok, ctx_after, final_multi}
-            {:error, _, _} = err -> err
-          end
+          built = build_emits(Enum.reverse(emit_jobs), final_ctx, opts)
+          {:ok, final_ctx, final_multi, built}
 
-        {:error, _, _} = err ->
-          err
+        {:error, reason, partial_ctx, partial_emit_jobs} ->
+          built = build_emits(Enum.reverse(partial_emit_jobs), partial_ctx, opts)
+          {:error, reason, partial_ctx, built}
       end
     end
 
@@ -158,7 +178,7 @@ if Code.ensure_loaded?(Ecto.Multi) do
           {:ok, {Map.put(ctx, {:assert, assertion.name}, true), skip, multi, emits}}
 
         {:error, reason} ->
-          {:error, reason, ctx}
+          {:error, reason, ctx, emits}
       end
     end
 
@@ -198,7 +218,7 @@ if Code.ensure_loaded?(Ecto.Multi) do
           {:ok, {Map.put(ctx, decision.name, branch), new_skip, multi, emits}}
 
         {:error, reason} ->
-          {:error, reason, ctx}
+          {:error, reason, ctx, emits}
       end
     end
 
@@ -230,7 +250,7 @@ if Code.ensure_loaded?(Ecto.Multi) do
 
       case raw do
         {:__raised__, name, exception} ->
-          {:error, {:task_raised, name, exception}, ctx}
+          {:error, {:task_raised, name, exception}, ctx, emits}
 
         other ->
           case normalize_run_result(other) do
@@ -247,7 +267,7 @@ if Code.ensure_loaded?(Ecto.Multi) do
               {:ok, {new_ctx, skip, new_multi, emits}}
 
             {:error, reason} ->
-              {:error, {:task_failed, task.name, reason}, ctx}
+              {:error, {:task_failed, task.name, reason}, ctx, emits}
           end
       end
     end
@@ -272,45 +292,45 @@ if Code.ensure_loaded?(Ecto.Multi) do
       sub_opts = Keyword.put(opts, :module, callee_module)
 
       case run_workflow(callee_workflow, sub_inputs, sub_opts) do
-        {:ok, sub_ctx, sub_multi} ->
+        {:ok, sub_ctx, sub_multi, sub_emits} ->
           new_ctx = Map.put(ctx, produce_key, sub_ctx)
-          # Always bubble up sub-workflow persists regardless of parent's persists list
           new_multi = Multi.merge(multi, fn _ -> sub_multi end)
-          {:ok, {new_ctx, skip, new_multi, emits}}
+          {:ok, {new_ctx, skip, new_multi, emits ++ sub_emits}}
 
-        {:error, reason, sub_ctx} ->
-          {:error, reason, Map.put(ctx, produce_key, sub_ctx)}
+        {:error, reason, sub_ctx, sub_partial_emits} ->
+          {:error, reason, Map.put(ctx, produce_key, sub_ctx), emits ++ sub_partial_emits}
       end
     end
 
     # -------------------------------------------------------------------------
-    # Emit job runner
+    # Emit payload builder
     # -------------------------------------------------------------------------
 
-    defp run_emit_jobs([], ctx, _opts), do: {:ok, ctx}
-
-    defp run_emit_jobs([emit | rest], ctx, opts) do
-      repo = Keyword.get(opts, :repo)
-      callback = Keyword.get(opts, :emit)
-      event = normalize_local_event_ref(opts, emit.event)
-      payload = build_emit_payload!(ctx, emit)
-
-      result =
-        invoke_emit_callback(callback, repo, ctx, event, payload, emit)
-        |> normalize_run_result()
-
-      case result do
-        {:ok, _} -> run_emit_jobs(rest, ctx, opts)
-        {:error, reason} -> {:error, {:emit_failed, emit.event, reason}, ctx}
-      end
+    defp build_emits(emit_jobs, ctx, opts) do
+      Enum.map(emit_jobs, fn emit ->
+        event = normalize_local_event_ref(opts, emit.event)
+        payload = build_emit_payload!(ctx, emit)
+        {event, payload}
+      end)
     end
 
     # -------------------------------------------------------------------------
     # Persist Multi accumulation
     # -------------------------------------------------------------------------
 
-    defp append_changeset_to_multi(multi, _op, %Shigoto.Ecto.ChangesetMulti{} = cm) do
-      Multi.merge(multi, fn _ -> Shigoto.Ecto.ChangesetMulti.to_multi(cm) end)
+    defp append_changeset_to_multi(multi, _op, entries)
+         when is_map(entries) and not is_struct(entries) do
+      Enum.reduce(entries, multi, fn {name, entry}, m ->
+        append_changeset_to_multi(m, name, entry)
+      end)
+    end
+
+    defp append_changeset_to_multi(multi, op, entries) when is_list(entries) do
+      entries
+      |> Enum.with_index()
+      |> Enum.reduce(multi, fn {entry, idx}, m ->
+        append_changeset_to_multi(m, {op, idx}, entry)
+      end)
     end
 
     defp append_changeset_to_multi(multi, op, %Ecto.Changeset{data: %_{__meta__: %{state: :built}}} = cs) do
@@ -493,47 +513,6 @@ if Code.ensure_loaded?(Ecto.Multi) do
     end
 
     # -------------------------------------------------------------------------
-    # Emit callback dispatch
-    # -------------------------------------------------------------------------
-
-    defp invoke_emit_callback(nil, _repo, _ctx, _event, payload, _emit) do
-      {:ok, payload}
-    end
-
-    defp invoke_emit_callback(callback, repo, ctx, event, payload, emit)
-         when is_function(callback) do
-      case fun_arity(callback) do
-        1 -> callback.(payload)
-        2 -> callback.(event, payload)
-        3 -> callback.(repo, event, payload)
-        4 -> callback.(repo, ctx, event, payload)
-        5 -> callback.(repo, ctx, event, payload, emit)
-        a -> raise ArgumentError, "invalid Shigoto emit callback arity #{a}"
-      end
-    end
-
-    defp invoke_emit_callback({module, function, extra_args}, repo, ctx, event, payload, _emit)
-         when is_atom(module) and is_atom(function) and is_list(extra_args) do
-      apply(module, function, [repo, ctx, event, payload | extra_args])
-    end
-
-    defp invoke_emit_callback({module, function, arity}, repo, ctx, event, payload, emit)
-         when is_atom(module) and is_atom(function) and is_integer(arity) do
-      case arity do
-        1 -> apply(module, function, [payload])
-        2 -> apply(module, function, [event, payload])
-        3 -> apply(module, function, [repo, event, payload])
-        4 -> apply(module, function, [repo, ctx, event, payload])
-        5 -> apply(module, function, [repo, ctx, event, payload, emit])
-        _ -> raise ArgumentError, "invalid Shigoto emit MFA arity #{arity}"
-      end
-    end
-
-    defp invoke_emit_callback(other, _r, _c, _e, _p, _emit) do
-      raise ArgumentError, "invalid Shigoto emit callback #{inspect(other)}"
-    end
-
-    # -------------------------------------------------------------------------
     # Emit payload building
     # -------------------------------------------------------------------------
 
@@ -666,11 +645,6 @@ if Code.ensure_loaded?(Ecto.Multi) do
     end
 
     defp fetch_input(inputs, name) when is_list(inputs), do: Keyword.fetch(inputs, name)
-
-    defp fun_arity(fun) do
-      {:arity, a} = :erlang.fun_info(fun, :arity)
-      a
-    end
 
     defp list(nil), do: []
     defp list(v) when is_list(v), do: v

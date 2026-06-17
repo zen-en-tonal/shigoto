@@ -205,8 +205,21 @@ if Code.ensure_loaded?(Ecto.Multi) do
       end)
     end
 
-    defp changeset_like_to_multi(%Shigoto.Ecto.ChangesetMulti{} = cm, _op, prefix) do
-      Shigoto.Ecto.ChangesetMulti.to_multi(cm, prefix)
+    defp changeset_like_to_multi(entries, _op, prefix)
+         when is_map(entries) and not is_struct(entries) do
+      Enum.reduce(entries, Multi.new(), fn {name, entry}, m ->
+        op = if prefix == [], do: name, else: {:shigoto_persist, prefix, name}
+        Multi.merge(m, fn _ -> changeset_like_to_multi(entry, op, prefix ++ [name]) end)
+      end)
+    end
+
+    defp changeset_like_to_multi(entries, _op, prefix) when is_list(entries) do
+      entries
+      |> Enum.with_index()
+      |> Enum.reduce(Multi.new(), fn {entry, idx}, m ->
+        op = if prefix == [], do: idx, else: {:shigoto_persist, prefix, idx}
+        Multi.merge(m, fn _ -> changeset_like_to_multi(entry, op, prefix ++ [idx]) end)
+      end)
     end
 
     defp changeset_like_to_multi(

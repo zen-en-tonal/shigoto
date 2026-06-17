@@ -92,10 +92,10 @@ defmodule MyApp.LLM do
 end
 
 defmodule MyApp.Rooms do
-  @type room :: 
-    MyApp.Room.t() 
-    | Ecto.Changeset.t() 
-    | Shigoto.Ecto.ChangesetMulti.t() 
+  @type room ::
+    MyApp.Room.t()
+    | Ecto.Changeset.t()
+    | %{atom() => Ecto.Changeset.t()}
     | map()
 
   @doc """
@@ -148,9 +148,8 @@ defmodule MyApp.Rooms do
       iex> MyApp.Rooms.room_available?(%{status: :reserved})
       :not_available
   """
-  def room_available?(%Shigoto.Ecto.ChangesetMulti{} = multi) do
-    Shigoto.Ecto.ChangesetMulti.fetch!(multi, :room)
-    |> room_available?()
+  def room_available?(%{room: room_cs}) do
+    room_cs |> Ecto.Changeset.apply_changes() |> room_available?()
   end
 
   def room_available?(%Ecto.Changeset{} = changeset) do
@@ -187,10 +186,9 @@ defmodule MyApp.Rooms do
     reserve(room, customer_id)
   end
 
-  def reserve(%Shigoto.Ecto.ChangesetMulti{} = multi, customer_id) do
-    Shigoto.Ecto.ChangesetMulti.flat_map(multi, :room, fn room ->
-      reserve(room, customer_id)
-    end)
+  def reserve(%{room: _} = changes, customer_id) do
+    room = Ecto.Changeset.apply_changes(changes.room)
+    Map.merge(changes, reserve(room, customer_id))
   end
 
   def reserve(%Ecto.Changeset{} = changeset, customer_id) do
@@ -210,10 +208,7 @@ defmodule MyApp.Rooms do
       %MyApp.Room.History{room_id: room.id}
       |> MyApp.Room.History.changeset(%{status: :reserved})
 
-    Shigoto.Ecto.ChangesetMulti.new(%{
-      room: room_changset,
-      history: history_changeset
-    })
+    %{room: room_changset, history: history_changeset}
   end
 
   def reserve(%{status: :reserved, customer_id: customer_id} = room, customer_id) do

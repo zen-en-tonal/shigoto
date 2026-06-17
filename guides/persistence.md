@@ -1,9 +1,9 @@
 # Persistence
 
 Shigoto separates domain logic from persistence. Domain functions produce
-*domain-valid change values* — changesets or `ChangesetMulti` structs. The
-executor collects these into an `Ecto.Multi` that the caller commits as a
-single transaction.
+*domain-valid change values* — changesets or maps of changesets. The executor
+collects these into an `Ecto.Multi` that the caller commits as a single
+transaction.
 
 ## The `persists` field
 
@@ -13,7 +13,7 @@ Declare which produced values should become DB operations:
 workflow do
   task :reserve_room do
     call {MyApp.Rooms, :reserve, [:rooms, :customer_id]}
-    produces :reservation        # returns a changeset or ChangesetMulti
+    produces :reservation        # returns a changeset or map of changesets
   end
 
   persists [:reservation]        # collected into the returned Ecto.Multi
@@ -23,7 +23,7 @@ end
 After execution:
 
 ```elixir
-{:ok, ctx, persist_multi} = Shigoto.Executor.run(...)
+{:ok, ctx, persist_multi, _emits} = Shigoto.Executor.run(...)
 {:ok, _} = MyApp.Repo.transaction(persist_multi)
 ```
 
@@ -33,18 +33,17 @@ After execution:
 |---|---|
 | `%Ecto.Changeset{data: %_{__meta__: %{state: :built}}}` | `Ecto.Multi.insert/3` |
 | `%Ecto.Changeset{}` (loaded state) | `Ecto.Multi.update/3` |
-| `%Shigoto.Ecto.ChangesetMulti{}` | Merged via `Ecto.Multi.merge/2` |
+| `%{name => changeset, ...}` (plain map) | Each entry expanded recursively |
+| `[changeset, ...]` (list) | Each entry expanded with indexed op keys |
 | Any other value | Skipped — no DB operation |
 
 Values produced by skipped nodes (non-taken decision branches) are never added
 to `persist_multi`.
 
-## `Shigoto.Ecto.ChangesetMulti`
+## Maps and lists of changesets
 
-A `ChangesetMulti` bundles multiple named changesets into a single domain-layer
-value. Domain functions produce it; the executor converts it into DB operations.
-
-### Creating one
+When a task produces multiple related changesets, return a plain map keyed by
+semantic name. The executor expands it into named `Ecto.Multi` operations:
 
 ```elixir
 defmodule MyApp.Rooms do
@@ -58,46 +57,35 @@ defmodule MyApp.Rooms do
       %MyApp.Room.History{room_id: room.id}
       |> MyApp.Room.History.changeset(%{status: :reserved})
 
-    Shigoto.Ecto.ChangesetMulti.new(%{
-      room: room_cs,
-      history: history_cs,
-    })
+    %{room: room_cs, history: history_cs}
   end
 end
 ```
 
-### Composing with `flat_map/3`
+### Composing changeset maps
 
-Chain domain functions that each accept and return changeset-like values:
+Use standard map operations to chain domain functions that pass changeset maps:
 
 ```elixir
-def reserve(%Shigoto.Ecto.ChangesetMulti{} = multi, customer_id) do
-  Shigoto.Ecto.ChangesetMulti.flat_map(multi, :room, fn room ->
-    # room is the result of Ecto.Changeset.apply_changes on the :room entry
-    reserve(room, customer_id)
-  end)
+def reserve(%{room: _} = changes, customer_id) do
+  room = Ecto.Changeset.apply_changes(changes.room)
+  Map.merge(changes, reserve(room, customer_id))
 end
 ```
 
-`flat_map/3` extracts the entry at `key`, applies changesets before passing them
-to `fun`, and merges the returned `ChangesetMulti` back. The function must return
-a `ChangesetMulti`.
+### Nested maps and lists
 
-### Converting to `Ecto.Multi`
-
-The executor calls `to_multi/1` automatically for values listed in `persists`.
-You can also call it directly:
+Maps and lists can be arbitrarily nested — the executor recurses into them:
 
 ```elixir
-multi = Shigoto.Ecto.ChangesetMulti.to_multi(changeset_multi)
-{:ok, _} = MyApp.Repo.transaction(multi)
+%{
+  room: room_cs,                          # becomes op key :room
+  extras: [amenity_cs, deposit_cs],       # becomes op keys {:extras, 0}, {:extras, 1}
+  audit: %{before: before_cs, after: after_cs}  # becomes op keys :before, :after
+}
 ```
 
-Each entry is inserted or updated based on the schema record's `__meta__.state`:
-- `:built` → `Ecto.Multi.insert`
-- `:loaded` → `Ecto.Multi.update`
-
-Nested `ChangesetMulti` entries are converted recursively.
+Non-changeset entries in maps or lists are silently skipped.
 
 ## Sub-workflow persists
 
@@ -140,18 +128,15 @@ impossible to:
 2. Test domain logic without a real database connection.
 3. Review what will be persisted before committing.
 
-By returning a changeset (or `ChangesetMulti`), the function remains a pure
+By returning a changeset (or a map of changesets), the function remains a pure
 data transformation. The caller — the Shigoto executor — decides when and how to
 commit.
 
-### Why `ChangesetMulti` instead of a plain list
+### Why use named maps instead of lists
 
-A `ChangesetMulti` is named. Each changeset entry has a key that identifies what
-it represents (`:room`, `:history`, `:invoice`). This makes composition via
-`flat_map` explicit: you say which entry you're transforming, not which index.
-
-It also makes debugging easier — `Ecto.Multi` operation keys are derived from
-the entry names, so failed operations identify themselves semantically.
+A plain map is named. Each entry has a key that identifies what it represents
+(`:room`, `:history`, `:invoice`). This makes `Ecto.Multi` operation keys
+semantically meaningful — a failed operation identifies itself by name.
 
 ### Why persists are declared on the workflow, not the function
 
@@ -162,7 +147,7 @@ belongs as a business concern.
 
 ## Working with optimistic locking
 
-`ChangesetMulti` works naturally with Ecto's optimistic locking:
+Plain changeset maps work naturally with Ecto's optimistic locking:
 
 ```elixir
 room_cs =
@@ -170,7 +155,7 @@ room_cs =
   |> MyApp.Room.changeset(%{status: :reserved})
   |> Ecto.Changeset.optimistic_lock(:lock_version)
 
-Shigoto.Ecto.ChangesetMulti.new(%{room: room_cs})
+%{room: room_cs}
 ```
 
 Ecto will verify the lock version when `Repo.transaction(persist_multi)` runs.
@@ -184,10 +169,10 @@ you can inspect it in tests without hitting the database:
 
 ```elixir
 test "reserve produces an insert and a history update" do
-  {:ok, ctx, persist_multi} =
+  {:ok, ctx, persist_multi, _emits} =
     Shigoto.Executor.run(MyApp.Workflows.RoomReserve, :reserve_room, inputs)
 
-  assert %Shigoto.Ecto.ChangesetMulti{} = ctx.reservation
+  assert %{room: %Ecto.Changeset{}, history: %Ecto.Changeset{}} = ctx.reservation
 
   ops = Ecto.Multi.to_list(persist_multi)
   assert length(ops) == 2
@@ -198,12 +183,12 @@ To test the actual DB writes, wrap in `Ecto.Adapters.SQL.Sandbox`:
 
 ```elixir
 test "reservation is committed" do
-  {:ok, ctx, persist_multi} =
+  {:ok, ctx, persist_multi, _emits} =
     Shigoto.Executor.run(MyApp.Workflows.RoomReserve, :reserve_room, inputs,
       repo: MyApp.Repo
     )
 
   assert {:ok, _} = MyApp.Repo.transaction(persist_multi)
-  assert MyApp.Repo.get(MyApp.Room, ctx.reservation.entries.room.changes.id)
+  assert MyApp.Repo.get(MyApp.Room, ctx.reservation.room.changes.id)
 end
 ```

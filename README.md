@@ -58,7 +58,7 @@ end
 Execute it:
 
 ```elixir
-{:ok, ctx, persist_multi} =
+{:ok, ctx, persist_multi, _emits} =
   Shigoto.Executor.run(MyApp.Workflows.OrderApproval, :order_approval, inputs, repo: MyApp.Repo)
 
 {:ok, _} = MyApp.Repo.transaction(persist_multi)
@@ -79,7 +79,7 @@ Add `shigoto` to your dependencies:
 def deps do
   [
     {:shigoto, "~> 0.1"},
-    # Optional — required only if you use persists or Shigoto.Ecto.ChangesetMulti
+    # Optional — required only if you use persists
     {:ecto, "~> 3.0", optional: true}
   ]
 end
@@ -152,13 +152,13 @@ DB operations, returned as an `Ecto.Multi` for the caller to commit:
 workflow do
   task :reserve do
     call {MyApp.Rooms, :reserve, [:rooms, :customer_id]}
-    produces :reservation         # returns a changeset or ChangesetMulti
+    produces :reservation         # returns a changeset or map of changesets
   end
 
   persists [:reservation]         # collected into the returned Ecto.Multi
 end
 
-{:ok, ctx, persist_multi} = Shigoto.Executor.run(...)
+{:ok, ctx, persist_multi, _emits} = Shigoto.Executor.run(...)
 {:ok, _} = MyApp.Repo.transaction(persist_multi)
 ```
 
@@ -176,7 +176,8 @@ end
 
 - [DSL Reference](guides/dsl_reference.md) — complete syntax reference
 - [Executor](guides/executor.md) — running workflows with `Shigoto.Executor`
-- [Persistence](guides/persistence.md) — `persists`, `Shigoto.Ecto.ChangesetMulti`
+- [Persistence](guides/persistence.md) — `persists` and changeset handling
+- [Automation](guides/automation.md) — routing emits with `Shigoto.Automation`
 - [Diagrams](guides/diagrams.md) — `mix shigoto.diagram`
 
 ## Diagram generation

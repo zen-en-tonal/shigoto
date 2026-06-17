@@ -33,10 +33,22 @@ defmodule Shigoto.ExecutorTest.PersistTasks do
   end
 
   def make_changeset_multi(_),
-    do:
-      Shigoto.Ecto.ChangesetMulti.new(%{
-        record: Ecto.Changeset.change(%FakeRecord{}, name: "bundled")
-      })
+    do: %{record: Ecto.Changeset.change(%FakeRecord{}, name: "bundled")}
+
+  def make_nested_changeset_map(_),
+    do: %{
+      group: %{
+        first: Ecto.Changeset.change(%FakeRecord{}, name: "nested1"),
+        second: Ecto.Changeset.change(%FakeRecord{}, name: "nested2")
+      },
+      direct: Ecto.Changeset.change(%FakeRecord{}, name: "direct")
+    }
+
+  def make_changeset_list(_),
+    do: [
+      Ecto.Changeset.change(%FakeRecord{}, name: "item1"),
+      Ecto.Changeset.change(%FakeRecord{}, name: "item2")
+    ]
 end
 
 # ---- Workflow modules ----
@@ -204,6 +216,36 @@ defmodule Shigoto.ExecutorTest.CmWf do
   end
 end
 
+defmodule Shigoto.ExecutorTest.NestedCmWf do
+  use Shigoto
+
+  workflow :nested_changeset_map do
+    input(:n, :integer)
+
+    task :make_changes do
+      call({Shigoto.ExecutorTest.PersistTasks, :make_nested_changeset_map, [:n]})
+      produces(:changes)
+    end
+
+    persists([:changes])
+  end
+end
+
+defmodule Shigoto.ExecutorTest.ListCmWf do
+  use Shigoto
+
+  workflow :changeset_list do
+    input(:n, :integer)
+
+    task :make_changes do
+      call({Shigoto.ExecutorTest.PersistTasks, :make_changeset_list, [:n]})
+      produces(:changes)
+    end
+
+    persists([:changes])
+  end
+end
+
 defmodule Shigoto.ExecutorTest.EmitWf do
   use Shigoto
 
@@ -308,7 +350,7 @@ defmodule Shigoto.ExecutorTest do
   defp multi_empty?(%Ecto.Multi{operations: ops}), do: ops == []
 
   test "basic task: result in context, persist multi empty" do
-    assert {:ok, ctx, multi} =
+    assert {:ok, ctx, multi, _emits} =
              Executor.run(Shigoto.ExecutorTest.SimpleWf, :simple, %{n: 5})
 
     assert ctx.result == 10
@@ -316,7 +358,7 @@ defmodule Shigoto.ExecutorTest do
   end
 
   test "chained tasks: dependency resolved via produces/requires" do
-    assert {:ok, ctx, _multi} =
+    assert {:ok, ctx, _multi, _emits} =
              Executor.run(Shigoto.ExecutorTest.TwoTaskWf, :chain, %{a: 3, b: 7})
 
     assert ctx.total == 10
@@ -325,7 +367,7 @@ defmodule Shigoto.ExecutorTest do
 
   test "decision: only taken branch vertex executes" do
     # positive branch
-    assert {:ok, ctx_pos, _} =
+    assert {:ok, ctx_pos, _, _} =
              Executor.run(Shigoto.ExecutorTest.DecisionWf, :decide, %{n: 4})
 
     assert ctx_pos.sign == :positive
@@ -334,7 +376,7 @@ defmodule Shigoto.ExecutorTest do
     refute Map.has_key?(ctx_pos, :zero_result)
 
     # negative branch
-    assert {:ok, ctx_neg, _} =
+    assert {:ok, ctx_neg, _, _} =
              Executor.run(Shigoto.ExecutorTest.DecisionWf, :decide, %{n: -2})
 
     assert ctx_neg.sign == :negative
@@ -343,7 +385,7 @@ defmodule Shigoto.ExecutorTest do
     refute Map.has_key?(ctx_neg, :zero_result)
 
     # zero branch
-    assert {:ok, ctx_zero, _} =
+    assert {:ok, ctx_zero, _, _} =
              Executor.run(Shigoto.ExecutorTest.DecisionWf, :decide, %{n: 0})
 
     assert ctx_zero.sign == :zero
@@ -353,29 +395,29 @@ defmodule Shigoto.ExecutorTest do
   end
 
   test "assertion passes: workflow completes" do
-    assert {:ok, ctx, _multi} =
+    assert {:ok, ctx, _multi, _emits} =
              Executor.run(Shigoto.ExecutorTest.AssertWf, :guarded, %{n: 7})
 
     assert ctx.result == 14
   end
 
   test "assertion fails: returns assertion_failed reason" do
-    assert {:error, {:assertion_failed, :check_positive}, _ctx} =
+    assert {:error, {:assertion_failed, :check_positive}, _ctx, _emits} =
              Executor.run(Shigoto.ExecutorTest.AssertWf, :guarded, %{n: -1})
   end
 
   test "task failure: returns task_failed with reason" do
-    assert {:error, {:task_failed, :bad, :boom}, _ctx} =
+    assert {:error, {:task_failed, :bad, :boom}, _ctx, _emits} =
              Executor.run(Shigoto.ExecutorTest.FailWf, :will_fail, %{n: 1})
   end
 
   test "task raise: returns task_raised with exception" do
-    assert {:error, {:task_raised, :boom, %ArgumentError{}}, _ctx} =
+    assert {:error, {:task_raised, :boom, %ArgumentError{}}, _ctx, _emits} =
              Executor.run(Shigoto.ExecutorTest.RaiseWf, :will_raise, %{n: 1})
   end
 
   test "repo option: passed to functions with :repo in arg spec" do
-    assert {:ok, ctx, _multi} =
+    assert {:ok, ctx, _multi, _emits} =
              Executor.run(
                Shigoto.ExecutorTest.RepoWf,
                :with_repo,
@@ -388,7 +430,7 @@ defmodule Shigoto.ExecutorTest do
   end
 
   test "persists: Ecto.Changeset with :built state → insert op in multi" do
-    assert {:ok, ctx, multi} =
+    assert {:ok, ctx, multi, _emits} =
              Executor.run(Shigoto.ExecutorTest.InsertWf, :inserting, %{n: 1})
 
     assert %Ecto.Changeset{} = ctx.record
@@ -399,7 +441,7 @@ defmodule Shigoto.ExecutorTest do
   end
 
   test "persists: Ecto.Changeset with :loaded state → update op in multi" do
-    assert {:ok, ctx, multi} =
+    assert {:ok, ctx, multi, _emits} =
              Executor.run(Shigoto.ExecutorTest.UpdateWf, :updating, %{n: 1})
 
     assert %Ecto.Changeset{} = ctx.record
@@ -409,52 +451,59 @@ defmodule Shigoto.ExecutorTest do
     assert cs.action == :update
   end
 
-  test "persists: ChangesetMulti entries → merged into multi" do
-    assert {:ok, ctx, multi} =
+  test "persists: plain map of changesets → expanded into multi" do
+    assert {:ok, ctx, multi, _emits} =
              Executor.run(Shigoto.ExecutorTest.CmWf, :multi_changeset, %{n: 1})
 
-    assert %Shigoto.Ecto.ChangesetMulti{} = ctx.changes
+    assert %{record: %Ecto.Changeset{}} = ctx.changes
+    refute multi_empty?(multi)
+  end
+
+  test "persists: nested changeset map → recursively expanded into multi" do
+    assert {:ok, ctx, multi, _emits} =
+             Executor.run(Shigoto.ExecutorTest.NestedCmWf, :nested_changeset_map, %{n: 1})
+
+    assert %{group: %{first: %Ecto.Changeset{}, second: %Ecto.Changeset{}}, direct: %Ecto.Changeset{}} =
+             ctx.changes
+
+    refute multi_empty?(multi)
+  end
+
+  test "persists: list of changesets → expanded into multi with indexed op keys" do
+    assert {:ok, ctx, multi, _emits} =
+             Executor.run(Shigoto.ExecutorTest.ListCmWf, :changeset_list, %{n: 1})
+
+    assert [%Ecto.Changeset{}, %Ecto.Changeset{}] = ctx.changes
     refute multi_empty?(multi)
   end
 
   test "no persists declared: multi stays empty" do
-    assert {:ok, ctx, multi} =
+    assert {:ok, ctx, multi, _emits} =
              Executor.run(Shigoto.ExecutorTest.SimpleWf, :simple, %{n: 5})
 
     assert ctx.result == 10
     assert multi_empty?(multi)
   end
 
-  test "emit: callback deferred until after all tasks, receives final payload" do
-    parent = self()
-    ref = make_ref()
-
-    callback = fn event, payload ->
-      send(parent, {ref, :emitted, event, payload})
-      :ok
-    end
-
-    assert {:ok, ctx, _multi} =
-             Executor.run(
-               Shigoto.ExecutorTest.EmitWf,
-               :emitting,
-               %{n: 6},
-               emit: callback
-             )
+  test "emit: payload returned in emits list" do
+    assert {:ok, ctx, _multi, emits} =
+             Executor.run(Shigoto.ExecutorTest.EmitWf, :emitting, %{n: 6})
 
     assert ctx.result == 12
-    assert_receive {^ref, :emitted, {Shigoto.ExecutorTest.EmitWf, :thing_done}, %{value: 12}}
+    assert [{event_ref, payload}] = emits
+    assert event_ref == {Shigoto.ExecutorTest.EmitWf, :thing_done}
+    assert payload == %{value: 12}
   end
 
-  test "emit: no callback → workflow completes without error" do
-    assert {:ok, ctx, _multi} =
-             Executor.run(Shigoto.ExecutorTest.EmitWf, :emitting, %{n: 3})
+  test "emit: emits list is empty when workflow has no emit nodes" do
+    assert {:ok, _ctx, _multi, emits} =
+             Executor.run(Shigoto.ExecutorTest.SimpleWf, :simple, %{n: 5})
 
-    assert ctx.result == 6
+    assert emits == []
   end
 
   test "sub-workflow: persists bubbled into parent multi" do
-    assert {:ok, ctx, multi} =
+    assert {:ok, ctx, multi, _emits} =
              Executor.run(Shigoto.ExecutorTest.SubOuterWf, :sub_outer, %{n: 1})
 
     assert is_map(ctx.inner_ctx)
@@ -465,7 +514,7 @@ defmodule Shigoto.ExecutorTest do
   test "run_automation: maps event payload to workflow inputs" do
     event_payload = %{amount: 5, item: "widget"}
 
-    assert {:ok, ctx, _multi} =
+    assert {:ok, ctx, _multi, _emits} =
              Executor.run_automation(
                Shigoto.ExecutorTest.AutomationWf,
                :on_order_placed,
@@ -484,7 +533,7 @@ defmodule Shigoto.ExecutorTest do
   end
 
   test "partial context returned on task failure" do
-    assert {:error, {:task_failed, :bad, :boom}, partial_ctx} =
+    assert {:error, {:task_failed, :bad, :boom}, partial_ctx, _emits} =
              Executor.run(Shigoto.ExecutorTest.FailWf, :will_fail, %{n: 42})
 
     assert partial_ctx.n == 42
@@ -496,7 +545,7 @@ defmodule Shigoto.ExecutorTest do
     [wf] = Shigoto.Info.workflows(Shigoto.ExecutorTest.AnonWf)
     assert wf.name == :anon_wf
 
-    assert {:ok, ctx, _multi} =
+    assert {:ok, ctx, _multi, _emits} =
              Executor.run(Shigoto.ExecutorTest.AnonWf, :anon_wf, %{n: 3})
 
     assert ctx.result == 6
