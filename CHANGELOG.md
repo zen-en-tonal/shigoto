@@ -1,6 +1,41 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
+
+### Added
+
+- **`Shigoto.Automation`** — pure, stateless helpers for routing executor emits
+  to matching `automation` declarations:
+  - `index/1` — builds a precomputed `event_ref => [auto_ref]` map from a list
+    of Shigoto modules.
+  - `match/2` — returns matching `{module, automation_name}` pairs for an emit
+    tuple or bare event ref; accepts a precomputed index or a module list.
+  - `idempotency_key/2` — extracts a deduplication key string from an emit
+    payload in the format `"automation_name:v1:v2:...:vN"`. Returns `nil` when
+    `idempotency_key` is not declared on the automation.
+  - `dispatch/2-3` — runs all automations matching a single emit; returns
+    `[{automation_name, run_result}]`. Failures are collected rather than raised.
+  - `dispatch_all/2-3` — convenience wrapper over a list of emits.
+
+- **Plain map and list changeset support in `persists`** — `persists` values may
+  now be `%{name => changeset}` maps or `[changeset]` lists, arbitrarily nested.
+  The executor expands them recursively into named `Ecto.Multi` operations. This
+  replaces `Shigoto.Ecto.ChangesetMulti`.
+
+- **`Shigoto.Executor` emit return** — `run/4`, `run_automation/4`, and
+  `run_workflow/3` now return a 4-tuple
+  `{:ok, context, persist_multi, emits}` / `{:error, reason, context, emits}`.
+  `emits` is a list of `{event_ref, payload}` tuples in topological order.
+
+### Removed
+
+- **`Shigoto.Ecto.ChangesetMulti`** — replaced by plain map and list changeset
+  handling in `Shigoto.Executor`. Update task return values from
+  `ChangesetMulti.new(%{name => cs})` to `%{name => cs}`.
+
+---
+
+## 0.1.0
 
 ### Added
 
@@ -9,16 +44,10 @@
   The caller is responsible for committing `persist_multi` via
   `Repo.transaction/2`. Replaces `Shigoto.Multi` as the recommended runtime.
 
-- **`Shigoto.Ecto.ChangesetMulti`** — domain-layer value bundling multiple
-  named changesets into a single unit, convertible to `Ecto.Multi` for
-  transactional persistence. Supports nested `ChangesetMulti` entries and
-  composition via `flat_map/3`.
-
 - **`persists` field on `workflow`** — declares which produced values the
   executor should collect as DB operations. Values may be `Ecto.Changeset`
-  (insert or update based on schema state) or `Shigoto.Ecto.ChangesetMulti`
-  (merged recursively). Sub-workflow persists bubble up into the parent's
-  returned `Ecto.Multi`.
+  (insert or update based on schema state). Sub-workflow persists bubble up
+  into the parent's returned `Ecto.Multi`.
 
 - **`mix shigoto.diagram`** — Mix task generating Mermaid flowchart diagrams
   from Shigoto workflow modules. Supports auto-discovery of all Shigoto modules
@@ -56,25 +85,6 @@
 - **`Shigoto.Multi.decode_error/1`** — public helper for decoding opaque Ecto
   Multi operation keys produced by Shigoto back into `{context, logical_name}`.
 
-### Changed
-
-- `automation.run` is now optional when the module has exactly one workflow.
-
-- `Shigoto.Export.Mermaid.workflow/2` overload now dispatches to the single
-  workflow when the module has exactly one, or raises with a clear message when
-  there are multiple.
-
-### Deprecated
-
-- **`Shigoto.Multi`** — superseded by `Shigoto.Executor`. `Shigoto.Multi`
-  remains fully functional and will be removed in a future release.
-
----
-
-## 0.1.0
-
-Initial release.
-
 - `event`, `workflow`, `automation` DSL constructs via Spark.
 - `task`, `decision`, `assert`, `emit` workflow nodes.
 - `input` declarations and `map` payload mappings.
@@ -87,3 +97,16 @@ Initial release.
 - `Shigoto.Multi` — `Ecto.Multi` execution adapter (wraps all nodes in
   `Multi.run`).
 - `Shigoto.Export.Mermaid` — Mermaid flowchart exporter.
+
+### Changed
+
+- `automation.run` is now optional when the module has exactly one workflow.
+
+- `Shigoto.Export.Mermaid.workflow/2` overload now dispatches to the single
+  workflow when the module has exactly one, or raises with a clear message when
+  there are multiple.
+
+### Deprecated
+
+- **`Shigoto.Multi`** — superseded by `Shigoto.Executor`. `Shigoto.Multi`
+  remains fully functional and will be removed in a future release.
