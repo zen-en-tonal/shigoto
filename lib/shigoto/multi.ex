@@ -1,6 +1,12 @@
 if Code.ensure_loaded?(Ecto.Multi) do
   defmodule Shigoto.Multi do
     @moduledoc """
+    > **Deprecated.** Use `Shigoto.Executor` instead.
+    >
+    > `Shigoto.Executor` evaluates workflow nodes eagerly outside any DB
+    > transaction and returns an `Ecto.Multi` containing only the `persists`
+    > changesets for the caller to commit.
+
     Converts Shigoto workflows into `Ecto.Multi`.
 
     This module is an optional execution adapter.
@@ -30,6 +36,22 @@ if Code.ensure_loaded?(Ecto.Multi) do
             | function()
             | {module(), atom(), arity()}
             | {module(), atom(), [term()]}
+
+    @doc """
+    Decodes an opaque Ecto.Multi operation key produced by Shigoto.
+
+    Returns `{:ok, {workflow_context, logical_name}}` or `:error`.
+
+    The `workflow_context` is the last element of the internal prefix path
+    (i.e., the workflow or task name that produced this operation), or `nil`
+    for top-level operations.
+    """
+    @spec decode_error(term()) :: {:ok, {atom() | nil, term()}} | :error
+    def decode_error({:shigoto, prefix, logical_name}) when is_list(prefix) do
+      {:ok, {List.last(prefix), logical_name}}
+    end
+
+    def decode_error(_), do: :error
 
     @doc """
     Builds an `Ecto.Multi` from a Shigoto workflow module and workflow name.
@@ -159,18 +181,65 @@ if Code.ensure_loaded?(Ecto.Multi) do
             multi
         end
       end)
+      |> add_persist_steps(workflow, opts)
     end
+
+    defp add_persist_steps(multi, workflow, opts) do
+      prefix = Keyword.get(opts, :prefix, [])
+
+      workflow.persists
+      |> list()
+      |> Enum.reduce(multi, fn persist_name, m ->
+        value_op = op_name(prefix, persist_name)
+        persist_op = op_name(prefix, {:persist, persist_name})
+
+        Multi.merge(m, fn changes ->
+          case Map.fetch(changes, value_op) do
+            {:ok, value} when not is_nil(value) ->
+              changeset_like_to_multi(value, persist_op, prefix)
+
+            _ ->
+              Multi.new()
+          end
+        end)
+      end)
+    end
+
+    defp changeset_like_to_multi(%Shigoto.Ecto.ChangesetMulti{} = cm, _op, prefix) do
+      Shigoto.Ecto.ChangesetMulti.to_multi(cm, prefix)
+    end
+
+    defp changeset_like_to_multi(
+           %Ecto.Changeset{data: %_{__meta__: %{state: :built}}} = cs,
+           op,
+           _prefix
+         ) do
+      Multi.insert(Multi.new(), op, cs)
+    end
+
+    defp changeset_like_to_multi(%Ecto.Changeset{} = cs, op, _prefix) do
+      Multi.update(Multi.new(), op, cs)
+    end
+
+    defp changeset_like_to_multi(_other, _op, _prefix), do: Multi.new()
 
     defp add_node(multi, _workflow, :assert, assertion, opts) do
       prefix = Keyword.get(opts, :prefix, [])
       op = op_name(prefix, {:assert, assertion.name})
 
       Multi.run(multi, op, fn repo, changes ->
-        args = required_values!(changes, prefix, assertion.requires)
+        case assertion.evaluated_by do
+          {module, function, arg_spec} when is_list(arg_spec) ->
+            invoke_with_spec({module, function, arg_spec}, repo, changes, prefix)
+            |> normalize_assertion_result(assertion)
 
-        assertion.evaluated_by
-        |> invoke(repo, args)
-        |> normalize_assertion_result(assertion)
+          mfa ->
+            args = required_values!(changes, prefix, assertion.requires)
+
+            mfa
+            |> invoke(repo, args)
+            |> normalize_assertion_result(assertion)
+        end
       end)
     end
 
@@ -197,11 +266,18 @@ if Code.ensure_loaded?(Ecto.Multi) do
 
       multi
       |> Multi.run(decision_op, fn repo, changes ->
-        args = required_values!(changes, prefix, decision.requires)
+        case decision.evaluated_by do
+          {module, function, arg_spec} when is_list(arg_spec) ->
+            invoke_with_spec({module, function, arg_spec}, repo, changes, prefix)
+            |> normalize_decision_result(decision)
 
-        decision.evaluated_by
-        |> invoke(repo, args)
-        |> normalize_decision_result(decision)
+          mfa ->
+            args = required_values!(changes, prefix, decision.requires)
+
+            mfa
+            |> invoke(repo, args)
+            |> normalize_decision_result(decision)
+        end
       end)
       |> Multi.merge(fn changes ->
         branch = Map.fetch!(changes, decision_op)
@@ -210,8 +286,14 @@ if Code.ensure_loaded?(Ecto.Multi) do
         graph = Shigoto.Graph.workflow_graph(workflow)
         branch_vertices = reachable_vertices(graph, target)
 
-        Multi.new()
-        |> compile_region(workflow, branch_vertices, opts)
+        branch_outer_requires = collect_branch_outer_requires(workflow, branch_vertices)
+
+        branch_multi =
+          Enum.reduce(branch_outer_requires, Multi.new(), fn req, m ->
+            Multi.put(m, op_name(prefix, req), get_value!(changes, prefix, req))
+          end)
+
+        compile_region(branch_multi, workflow, branch_vertices, opts)
       end)
     end
 
@@ -235,11 +317,18 @@ if Code.ensure_loaded?(Ecto.Multi) do
       op = op_name(prefix, task.produces || task.name)
 
       Multi.run(multi, op, fn repo, changes ->
-        args = required_values!(changes, prefix, task.requires)
+        case task.call do
+          {module, function, arg_spec} when is_list(arg_spec) ->
+            invoke_with_spec({module, function, arg_spec}, repo, changes, prefix)
+            |> normalize_run_result()
 
-        task.call
-        |> invoke(repo, args)
-        |> normalize_run_result()
+          mfa ->
+            args = required_values!(changes, prefix, task.requires)
+
+            mfa
+            |> invoke(repo, args)
+            |> normalize_run_result()
+        end
       end)
     end
 
@@ -255,11 +344,7 @@ if Code.ensure_loaded?(Ecto.Multi) do
       multi
       |> Multi.merge(fn changes ->
         {callee_module, callee_workflow} =
-          resolve_workflow_call!(
-            task.workflow,
-            current_module,
-            resolver
-          )
+          resolve_workflow_call!(task.workflow, current_module, resolver)
 
         sub_inputs =
           task.requires
@@ -277,7 +362,10 @@ if Code.ensure_loaded?(Ecto.Multi) do
         )
       end)
       |> Multi.run(produced_op, fn _repo, changes ->
-        {:ok, collect_prefixed_changes(changes, sub_prefix)}
+        {_callee_module, callee_workflow} =
+          resolve_workflow_call!(task.workflow, current_module, resolver)
+
+        {:ok, collect_sub_workflow_outputs(changes, sub_prefix, callee_workflow)}
       end)
     end
 
@@ -437,6 +525,11 @@ if Code.ensure_loaded?(Ecto.Multi) do
       resolver.(module, workflow_name)
     end
 
+    defp resolve_workflow_call!({module, workflow_name, _args}, _current_module, resolver)
+         when is_atom(module) and is_atom(workflow_name) do
+      resolver.(module, workflow_name)
+    end
+
     defp resolve_workflow_call!(other, _current_module, _resolver) do
       raise ArgumentError,
             "invalid workflow call #{inspect(other)}. Expected :workflow_name or {Module, :workflow_name}"
@@ -569,6 +662,17 @@ if Code.ensure_loaded?(Ecto.Multi) do
             "invalid Shigoto MFA #{inspect(other)}. Expected {Module, function, arity}"
     end
 
+    defp invoke_with_spec({module, function, arg_spec}, repo, changes, prefix)
+         when is_atom(module) and is_atom(function) and is_list(arg_spec) do
+      args =
+        Enum.map(arg_spec, fn
+          :repo -> repo
+          name when is_atom(name) -> get_value!(changes, prefix, name)
+        end)
+
+      apply(module, function, args)
+    end
+
     defp invoke_emit(nil, _repo, _changes, _event, payload, _emit) do
       {:ok, payload}
     end
@@ -657,13 +761,57 @@ if Code.ensure_loaded?(Ecto.Multi) do
       end
     end
 
-    defp collect_prefixed_changes(changes, prefix) do
-      Enum.reduce(changes, %{}, fn
-        {{:shigoto, ^prefix, logical_name}, value}, acc ->
-          Map.put(acc, logical_name, value)
+    defp collect_sub_workflow_outputs(changes, prefix, workflow) do
+      input_pairs =
+        Enum.map(list(workflow.inputs), fn inp -> {inp.name, op_name(prefix, inp.name)} end)
 
-        {_key, _value}, acc ->
-          acc
+      assertion_pairs =
+        Enum.map(list(workflow.assertions), fn a ->
+          {{:assert, a.name}, op_name(prefix, {:assert, a.name})}
+        end)
+
+      task_pairs =
+        Enum.map(list(workflow.tasks), fn t ->
+          n = t.produces || t.name
+          {n, op_name(prefix, n)}
+        end)
+
+      decision_pairs =
+        Enum.map(list(workflow.decisions), fn d -> {d.name, op_name(prefix, d.name)} end)
+
+      (input_pairs ++ assertion_pairs ++ task_pairs ++ decision_pairs)
+      |> Enum.reduce(%{}, fn {logical, key}, acc ->
+        case Map.fetch(changes, key) do
+          {:ok, value} -> Map.put(acc, logical, value)
+          :error -> acc
+        end
+      end)
+    end
+
+    defp collect_branch_outer_requires(workflow, branch_vertices) do
+      branch_produces =
+        workflow.tasks
+        |> list()
+        |> Enum.filter(&MapSet.member?(branch_vertices, &1.name))
+        |> Enum.map(& &1.produces)
+        |> Enum.reject(&is_nil/1)
+        |> MapSet.new()
+
+      input_names =
+        workflow.inputs
+        |> list()
+        |> Enum.map(& &1.name)
+        |> MapSet.new()
+
+      branch_nodes =
+        (list(workflow.tasks) ++ list(workflow.assertions) ++ list(workflow.decisions))
+        |> Enum.filter(&MapSet.member?(branch_vertices, &1.name))
+
+      branch_nodes
+      |> Enum.flat_map(&list(&1.requires))
+      |> Enum.uniq()
+      |> Enum.reject(fn req ->
+        MapSet.member?(branch_produces, req) or MapSet.member?(input_names, req)
       end)
     end
 

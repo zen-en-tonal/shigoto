@@ -21,7 +21,7 @@ defmodule ShigotoTest do
         call: {MyApp.OrderPolicy, :evaluate, 1},
         requires: [:order],
         produces: :policy_result,
-        after: [:load_order]
+        after_nodes: [:load_order]
 
       decision :approval_required,
         evaluated_by: {MyApp.OrderPolicy, :approval_required?, 1},
@@ -30,12 +30,22 @@ defmodule ShigotoTest do
           required: :request_manager_approval,
           not_required: :mark_approved
         ]
+
+      task :request_manager_approval,
+        call: {MyApp.Approvals, :request, 1},
+        requires: [:order],
+        produces: :approval_request
+
+      task :mark_approved,
+        call: {MyApp.Orders, :mark_approved, 1},
+        requires: [:order],
+        produces: :approved_order
     end
 
-    automation :approve_order_when_submitted,
-      on: :order_submitted,
-      run: :approve_order do
-      map_input :order_id, from: [:event, :order_id]
+    automation :approve_order_when_submitted do
+      on :order_submitted
+      run :approve_order
+      map :order_id, from: [:order_id]
     end
   end
 
@@ -46,18 +56,30 @@ defmodule ShigotoTest do
     assert first_field.name == :order_id
     assert second_field.name == :submitted_by
 
-    assert [%{name: :approve_order, inputs: [input], tasks: [load_order, evaluate_policy], decisions: [decision]}] =
-             ir.workflows
+    assert [
+             %{
+               name: :approve_order,
+               inputs: [input],
+               tasks: [load_order, evaluate_policy, _request, _mark],
+               decisions: [decision]
+             }
+           ] = ir.workflows
 
     assert input.name == :order_id
     assert load_order.name == :load_order
-    assert evaluate_policy.after == [:load_order]
+    assert evaluate_policy.after_nodes == [:load_order]
     assert decision.name == :approval_required
 
-    assert [%{name: :approve_order_when_submitted, on: :order_submitted, run: :approve_order, mappings: [mapping]}] =
-             ir.automations
+    assert [
+             %{
+               name: :approve_order_when_submitted,
+               on: :order_submitted,
+               run: :approve_order,
+               mappings: [mapping]
+             }
+           ] = ir.automations
 
-    assert mapping.input == :order_id
-    assert mapping.from == [:event, :order_id]
+    assert mapping.target == :order_id
+    assert mapping.from == [:order_id]
   end
 end

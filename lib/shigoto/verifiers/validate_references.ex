@@ -22,7 +22,8 @@ defmodule Shigoto.Verifiers.ValidateReferences do
            :ok <- validate_required_values(workflow),
            :ok <- validate_after_refs(workflow),
            :ok <- validate_decision_branches(workflow),
-           :ok <- validate_workflow_emits(workflow, events_by_name) do
+           :ok <- validate_workflow_emits(workflow, events_by_name),
+           :ok <- validate_cross_module_workflow_calls(workflow) do
         :ok
       end
     end)
@@ -74,7 +75,18 @@ defmodule Shigoto.Verifiers.ValidateReferences do
   end
 
   defp validate_required_values(workflow) do
-    available_values = available_values(workflow)
+    graph = Shigoto.Graph.workflow_graph(workflow)
+
+    input_names =
+      workflow.inputs
+      |> List.wrap()
+      |> Enum.map(& &1.name)
+      |> MapSet.new()
+
+    tasks_by_name =
+      workflow.tasks
+      |> List.wrap()
+      |> Map.new(& {&1.name, &1})
 
     nodes =
       []
@@ -82,21 +94,38 @@ defmodule Shigoto.Verifiers.ValidateReferences do
       |> Kernel.++(tag_nodes(:task, workflow.tasks || []))
       |> Kernel.++(tag_nodes(:decision, workflow.decisions || []))
 
-    each(nodes, fn {kind, node} ->
-      missing =
-        node
-        |> Map.get(:requires, [])
-        |> Enum.reject(&MapSet.member?(available_values, &1))
+    Shigoto.Graph.with_digraph(graph, fn digraph ->
+      each(nodes, fn {kind, node} ->
+        ancestors = :digraph_utils.reaching([node.name], digraph) |> MapSet.new()
 
-      case missing do
-        [] ->
-          :ok
+        ancestor_produces =
+          ancestors
+          |> Enum.flat_map(fn ancestor_name ->
+            case Map.fetch(tasks_by_name, ancestor_name) do
+              {:ok, task} when not is_nil(task.produces) -> [task.produces]
+              _ -> []
+            end
+          end)
+          |> MapSet.new()
 
-        _ ->
-          error(
-            "#{kind} #{inspect(node.name)} in workflow #{inspect(workflow.name)} requires unknown values #{inspect(missing)}"
-          )
-      end
+        available = MapSet.union(input_names, ancestor_produces)
+
+        missing =
+          node
+          |> Map.get(:requires, [])
+          |> List.wrap()
+          |> Enum.reject(&MapSet.member?(available, &1))
+
+        case missing do
+          [] ->
+            :ok
+
+          _ ->
+            error(
+              "#{kind} #{inspect(node.name)} in workflow #{inspect(workflow.name)} requires unavailable values #{inspect(missing)}"
+            )
+        end
+      end)
     end)
   end
 
@@ -178,7 +207,7 @@ defmodule Shigoto.Verifiers.ValidateReferences do
   end
 
   defp validate_workflow_emits(workflow, events_by_name) do
-    available_values = available_values(workflow)
+    available_values = flat_available_values(workflow)
 
     each(workflow.emits || [], fn emit ->
       case Map.fetch(events_by_name, emit.event) do
@@ -303,6 +332,75 @@ defmodule Shigoto.Verifiers.ValidateReferences do
     end
   end
 
+  defp validate_cross_module_workflow_calls(workflow) do
+    each(workflow.tasks || [], fn task ->
+      case task.workflow do
+        {module, sub_name} when is_atom(module) and is_atom(sub_name) ->
+          validate_external_sub_workflow(task, workflow, module, sub_name)
+
+        {module, sub_name, _args} when is_atom(module) and is_atom(sub_name) ->
+          validate_external_sub_workflow(task, workflow, module, sub_name)
+
+        _ ->
+          :ok
+      end
+    end)
+  end
+
+  defp validate_external_sub_workflow(task, workflow, module, sub_name) do
+    case fetch_external_workflow(module, sub_name) do
+      {:ok, sub_workflow} ->
+        sub_input_names =
+          sub_workflow.inputs
+          |> List.wrap()
+          |> Enum.map(& &1.name)
+          |> MapSet.new()
+
+        task_requires = task.requires |> List.wrap() |> MapSet.new()
+        extra = MapSet.difference(task_requires, sub_input_names)
+
+        case MapSet.to_list(extra) do
+          [] ->
+            :ok
+
+          extra_list ->
+            error(
+              "task #{inspect(task.name)} in workflow #{inspect(workflow.name)} passes values #{inspect(extra_list)} not declared as inputs in #{inspect(module)}.#{sub_name}"
+            )
+        end
+
+      :unknown ->
+        :ok
+
+      {:error, message} ->
+        error(message)
+    end
+  end
+
+  defp fetch_external_workflow(module, workflow_name) do
+    case Code.ensure_loaded(module) do
+      {:module, ^module} ->
+        try do
+          module
+          |> Shigoto.Info.workflows()
+          |> Enum.find(&(&1.name == workflow_name))
+          |> case do
+            nil ->
+              {:error,
+               "Unknown external workflow #{inspect(workflow_name)} in module #{inspect(module)}"}
+
+            workflow ->
+              {:ok, workflow}
+          end
+        rescue
+          _ -> :unknown
+        end
+
+      _ ->
+        :unknown
+    end
+  end
+
   defp fetch_workflow(workflow_name, workflows_by_name, automation) do
     case Map.fetch(workflows_by_name, workflow_name) do
       {:ok, workflow} ->
@@ -380,7 +478,7 @@ defmodule Shigoto.Verifiers.ValidateReferences do
     |> MapSet.new()
   end
 
-  defp available_values(workflow) do
+  defp flat_available_values(workflow) do
     input_values =
       workflow.inputs
       |> List.wrap()

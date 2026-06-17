@@ -36,6 +36,7 @@ defmodule Shigoto.Dsl do
       :name,
       :requires,
       :after_nodes,
+      :after_node,
       :evaluated_by,
       :summary,
       :__identifier__,
@@ -51,6 +52,7 @@ defmodule Shigoto.Dsl do
       :requires,
       :produces,
       :after_nodes,
+      :after_node,
       :summary,
       :__identifier__,
       :__spark_metadata__
@@ -63,6 +65,7 @@ defmodule Shigoto.Dsl do
       :evaluated_by,
       :requires,
       :after_nodes,
+      :after_node,
       :branches,
       :summary,
       :__identifier__,
@@ -83,6 +86,7 @@ defmodule Shigoto.Dsl do
     defstruct [
       :event,
       :after_nodes,
+      :after_node,
       :__identifier__,
       :__spark_metadata__,
       mappings: []
@@ -98,6 +102,7 @@ defmodule Shigoto.Dsl do
       tasks: [],
       decisions: [],
       emits: [],
+      persists: [],
       __identifier__: nil,
       __spark_metadata__: nil
     ]
@@ -186,11 +191,14 @@ defmodule Shigoto.Dsl do
                  ),
                  Field.new(:after_nodes, {:list, :atom},
                    default: [],
-                   doc: "Predecessor nodes"
+                   doc: "Predecessor nodes (list form)"
+                 ),
+                 Field.new(:after_node, :atom,
+                   doc: "Single predecessor node (convenience alias for after_nodes)"
                  ),
                  Field.new(:evaluated_by, :any,
                    required: true,
-                   doc: "{Module, function, arity}"
+                   doc: "{Module, function, arity | arg_list}"
                  ),
                  Field.new(:summary, :string, doc: "Human-readable assertion summary")
                ]
@@ -206,10 +214,10 @@ defmodule Shigoto.Dsl do
               doc: "Task name"
             ),
             Field.new(:call, :any,
-              doc: "{Module, function, arity}"
+              doc: "{Module, function, arity | arg_list}"
             ),
             Field.new(:workflow, :any,
-              doc: "{Module, workflow_name}"
+              doc: "{Module, workflow_name} or {Module, workflow_name, arg_list}"
             ),
             Field.new(:requires, {:list, :atom},
               default: [],
@@ -218,7 +226,10 @@ defmodule Shigoto.Dsl do
             Field.new(:produces, :atom, doc: "Produced value"),
             Field.new(:after_nodes, {:list, :atom},
               default: [],
-              doc: "Predecessor nodes"
+              doc: "Predecessor nodes (list form)"
+            ),
+            Field.new(:after_node, :atom,
+              doc: "Single predecessor node (convenience alias for after_nodes)"
             ),
             Field.new(:summary, :string, doc: "Task-specific human summary")
           ]
@@ -235,7 +246,7 @@ defmodule Shigoto.Dsl do
                 ),
                 Field.new(:evaluated_by, :any,
                   required: true,
-                  doc: "{Module, function, arity}"
+                  doc: "{Module, function, arity | arg_list}"
                 ),
                 Field.new(:requires, {:list, :atom},
                   default: [],
@@ -243,7 +254,10 @@ defmodule Shigoto.Dsl do
                 ),
                 Field.new(:after_nodes, {:list, :atom},
                   default: [],
-                  doc: "Predecessor nodes"
+                  doc: "Predecessor nodes (list form)"
+                ),
+                Field.new(:after_node, :atom,
+                  doc: "Single predecessor node (convenience alias for after_nodes)"
                 ),
                 Field.new(:branches, :any,
                   required: true,
@@ -279,7 +293,10 @@ defmodule Shigoto.Dsl do
             ),
             Field.new(:after_nodes, {:list, :atom},
               default: [],
-              doc: "Predecessor nodes"
+              doc: "Predecessor nodes (list form)"
+            ),
+            Field.new(:after_node, :atom,
+              doc: "Single predecessor node (convenience alias for after_nodes)"
             )
           ],
           entities: [
@@ -289,15 +306,20 @@ defmodule Shigoto.Dsl do
         |> Entity.build!()
 
   @workflow Entity.new(:workflow, Workflow,
-              args: [:name],
+              args: [{:optional, :name, :__default__}],
               identifier: :name,
               describe: "Defines a domain workflow",
               schema: [
                 Field.new(:name, :atom,
-                  required: true,
-                  doc: "Workflow name"
+                  required: false,
+                  default: :__default__,
+                  doc: "Workflow name (optional for single-workflow modules)"
                 ),
-                Field.new(:doc_ref, :any, doc: "Reference to a generated documentation function")
+                Field.new(:doc_ref, :any, doc: "Reference to a generated documentation function"),
+                Field.new(:persists, {:list, :atom},
+                  default: [],
+                  doc: "Names of produced values to persist as a DB transaction"
+                )
               ],
               entities: [
                 inputs: [@input],
@@ -330,8 +352,7 @@ defmodule Shigoto.Dsl do
                     doc: "Fields used to derive an idempotency key"
                   ),
                   Field.new(:run, :atom,
-                    required: true,
-                    doc: "Workflow to run"
+                    doc: "Workflow to run (inferred for single-workflow modules)"
                   )
                 ],
                 entities: [
@@ -363,6 +384,9 @@ defmodule Shigoto.Dsl do
 
   use Spark.Dsl.Extension,
     sections: [@events, @workflows, @automations],
+    transformers: [
+      Shigoto.Transformers.InferMetadata
+    ],
     verifiers: [
       Shigoto.Verifiers.ValidateReferences,
       Shigoto.Verifiers.ValidateTaskXor,

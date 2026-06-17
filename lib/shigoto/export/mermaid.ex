@@ -59,7 +59,25 @@ defmodule Shigoto.Export.Mermaid do
       )
 
   """
-  def workflow(module, workflow_name, opts \\ []) do
+  def workflow(module) when is_atom(module) do
+    workflow(module, [])
+  end
+
+  def workflow(module, opts) when is_atom(module) and is_list(opts) do
+    workflows = Shigoto.Info.workflows(module)
+
+    case workflows do
+      [single] -> workflow(module, single.name, opts)
+      [] -> raise ArgumentError, "#{inspect(module)} has no workflows"
+      _ -> raise ArgumentError, "#{inspect(module)} has multiple workflows; specify a workflow name"
+    end
+  end
+
+  def workflow(module, workflow_name) when is_atom(module) and is_atom(workflow_name) do
+    workflow(module, workflow_name, [])
+  end
+
+  def workflow(module, workflow_name, opts) do
     workflow = fetch_workflow!(module, workflow_name)
     automations = automations_for_workflow(module, workflow_name)
     graph = Shigoto.Graph.workflow_graph(workflow)
@@ -500,11 +518,21 @@ defmodule Shigoto.Export.Mermaid do
     "#{inspect(module)}.#{function}/#{arity}"
   end
 
+  defp format_mfa({module, function, arg_spec})
+       when is_atom(module) and is_atom(function) and is_list(arg_spec) do
+    args = arg_spec |> Enum.map(&inspect/1) |> Enum.join(", ")
+    "#{inspect(module)}.#{function}(#{args})"
+  end
+
   defp format_mfa(other), do: inspect(other)
 
   defp format_workflow_ref(name) when is_atom(name), do: Atom.to_string(name)
 
   defp format_workflow_ref({module, name}) when is_atom(module) and is_atom(name) do
+    "#{inspect(module)}.#{name}"
+  end
+
+  defp format_workflow_ref({module, name, _args}) when is_atom(module) and is_atom(name) do
     "#{inspect(module)}.#{name}"
   end
 
