@@ -49,6 +49,24 @@ defmodule Shigoto.ExecutorTest.PersistTasks do
       Ecto.Changeset.change(%FakeRecord{}, name: "item1"),
       Ecto.Changeset.change(%FakeRecord{}, name: "item2")
     ]
+
+  def make_multi(n) do
+    Ecto.Multi.new()
+    |> Ecto.Multi.insert(:multi_record, Ecto.Changeset.change(%FakeRecord{}, name: "multi#{n}"))
+  end
+
+  def make_nested_multi(n) do
+    %{
+      direct: Ecto.Changeset.change(%FakeRecord{}, name: "direct#{n}"),
+      nested: [
+        Ecto.Multi.new()
+        |> Ecto.Multi.insert(
+          :nested_multi_record,
+          Ecto.Changeset.change(%FakeRecord{}, name: "nested#{n}")
+        )
+      ]
+    }
+  end
 end
 
 # ---- Workflow modules ----
@@ -239,6 +257,49 @@ defmodule Shigoto.ExecutorTest.ListCmWf do
 
     task :make_changes do
       call({Shigoto.ExecutorTest.PersistTasks, :make_changeset_list, [:n]})
+      produces(:changes)
+    end
+
+    persists([:changes])
+  end
+end
+
+defmodule Shigoto.ExecutorTest.MultiWf do
+  use Shigoto
+
+  workflow :returned_multi do
+    input(:n, :integer)
+
+    task :make_multi do
+      call({Shigoto.ExecutorTest.PersistTasks, :make_multi, [:n]})
+      produces(:changes)
+    end
+
+    persists([:changes])
+  end
+end
+
+defmodule Shigoto.ExecutorTest.UnpersistedMultiWf do
+  use Shigoto
+
+  workflow :unpersisted_multi do
+    input(:n, :integer)
+
+    task :make_multi do
+      call({Shigoto.ExecutorTest.PersistTasks, :make_multi, [:n]})
+      produces(:changes)
+    end
+  end
+end
+
+defmodule Shigoto.ExecutorTest.NestedMultiWf do
+  use Shigoto
+
+  workflow :nested_multi do
+    input(:n, :integer)
+
+    task :make_changes do
+      call({Shigoto.ExecutorTest.PersistTasks, :make_nested_multi, [:n]})
       produces(:changes)
     end
 
@@ -475,6 +536,36 @@ defmodule Shigoto.ExecutorTest do
 
     assert [%Ecto.Changeset{}, %Ecto.Changeset{}] = ctx.changes
     refute multi_empty?(multi)
+  end
+
+  test "persists: Ecto.Multi is merged into persist multi" do
+    assert {:ok, ctx, multi, _emits} =
+             Executor.run(Shigoto.ExecutorTest.MultiWf, :returned_multi, %{n: 1})
+
+    assert %Ecto.Multi{} = ctx.changes
+    assert [{:merge, {:merge, merge_fun}}] = Ecto.Multi.to_list(multi)
+
+    assert %Ecto.Multi{} = returned = merge_fun.(%{})
+    assert [{:multi_record, {:insert, %Ecto.Changeset{}, _opts}}] = Ecto.Multi.to_list(returned)
+  end
+
+  test "persists: nested Ecto.Multi values are merged recursively" do
+    assert {:ok, ctx, multi, _emits} =
+             Executor.run(Shigoto.ExecutorTest.NestedMultiWf, :nested_multi, %{n: 1})
+
+    assert %{direct: %Ecto.Changeset{}, nested: [%Ecto.Multi{}]} = ctx.changes
+
+    ops = Ecto.Multi.to_list(multi)
+    assert Enum.any?(ops, &match?({:direct, {:insert, %Ecto.Changeset{}, _opts}}, &1))
+    assert Enum.any?(ops, &match?({:merge, {:merge, _fun}}, &1))
+  end
+
+  test "Ecto.Multi result is not persisted unless produces name is in persists" do
+    assert {:ok, ctx, multi, _emits} =
+             Executor.run(Shigoto.ExecutorTest.UnpersistedMultiWf, :unpersisted_multi, %{n: 1})
+
+    assert %Ecto.Multi{} = ctx.changes
+    assert multi_empty?(multi)
   end
 
   test "no persists declared: multi stays empty" do

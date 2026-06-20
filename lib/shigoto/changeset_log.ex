@@ -150,8 +150,8 @@ if Code.ensure_loaded?(Ecto.Multi) do
     - `:built` → `Ecto.Multi.insert`
     - `:loaded` → `Ecto.Multi.update`
 
-    Used by `Shigoto.Executor` and `Shigoto.Multi` for persistence. Prefer
-    `project/2` when you only need the current entity state.
+    Used by `Shigoto.Executor` for persistence. Prefer `project/2` when you only
+    need the current entity state.
     """
     @spec to_changesets(t()) :: [Ecto.Changeset.t()]
     def to_changesets(%__MODULE__{entries: entries}) do

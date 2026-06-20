@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.0
+
+### Added
+
+- **`Ecto.Multi` values in `persists`** — domain functions may return an
+  `Ecto.Multi` when they need a complex transaction recipe. The executor merges
+  returned Multi values only when their `produces` name is listed in `persists`;
+  operation names are preserved.
+
+### Removed
+
+- **Deprecated workflow-to-`Ecto.Multi` adapter** — removed the old
+  `Shigoto.Multi` runtime. Use `Shigoto.Executor`, which returns a persist
+  Multi for the caller to commit.
+
+---
+
 ## 0.3.0
 
 ### Added
@@ -21,7 +38,7 @@
     changesets back into the log. `fun` may return a single `Ecto.Changeset`,
     a list, or a keyword list `[{atom, changeset}]` (key becomes `domain_op`).
   - `to_changesets(log)` — returns the stored changesets in order; used by
-    `Shigoto.Executor` and `Shigoto.Multi` for persistence.
+    `Shigoto.Executor` for persistence.
 
   `log.initial` is `%{module() => struct()}` — multi-schema support, so a single
   log can accumulate changesets for e.g. `Room` and `Room.History` in one pass.
@@ -73,7 +90,7 @@
 - **`Shigoto.Executor`** — eager workflow runner that evaluates all nodes
   outside any DB transaction and returns `{:ok, context, persist_multi}`.
   The caller is responsible for committing `persist_multi` via
-  `Repo.transaction/2`. Replaces `Shigoto.Multi` as the recommended runtime.
+  `Repo.transaction/2`.
 
 - **`persists` field on `workflow`** — declares which produced values the
   executor should collect as DB operations. Values may be `Ecto.Changeset`
@@ -113,9 +130,6 @@
   using `:digraph_utils.reaching/2` to verify each node's required values are
   reachable from its ancestors; cross-module sub-workflow input validation.
 
-- **`Shigoto.Multi.decode_error/1`** — public helper for decoding opaque Ecto
-  Multi operation keys produced by Shigoto back into `{context, logical_name}`.
-
 - `event`, `workflow`, `automation` DSL constructs via Spark.
 - `task`, `decision`, `assert`, `emit` workflow nodes.
 - `input` declarations and `map` payload mappings.
@@ -125,8 +139,6 @@
 - `Shigoto.IR` — converts a module to plain maps for downstream processing.
 - `Shigoto.Graph` — builds a dependency graph; cycle detection via Erlang
   `:digraph` / `:digraph_utils`.
-- `Shigoto.Multi` — `Ecto.Multi` execution adapter (wraps all nodes in
-  `Multi.run`).
 - `Shigoto.Export.Mermaid` — Mermaid flowchart exporter.
 
 ### Changed
@@ -136,8 +148,3 @@
 - `Shigoto.Export.Mermaid.workflow/2` overload now dispatches to the single
   workflow when the module has exactly one, or raises with a clear message when
   there are multiple.
-
-### Deprecated
-
-- **`Shigoto.Multi`** — superseded by `Shigoto.Executor`. `Shigoto.Multi`
-  remains fully functional and will be removed in a future release.

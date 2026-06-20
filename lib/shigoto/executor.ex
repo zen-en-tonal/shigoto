@@ -318,6 +318,10 @@ if Code.ensure_loaded?(Ecto.Multi) do
     # Persist Multi accumulation
     # -------------------------------------------------------------------------
 
+    defp append_changeset_to_multi(multi, _op, %Multi{} = returned_multi) do
+      Multi.merge(multi, fn _ -> returned_multi end)
+    end
+
     defp append_changeset_to_multi(multi, op, %Shigoto.ChangesetLog{} = log) do
       append_changeset_to_multi(multi, op, Shigoto.ChangesetLog.to_changesets(log))
     end

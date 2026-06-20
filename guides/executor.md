@@ -149,6 +149,10 @@ Domain functions may return:
 | `{:error, reason}` | Failure; workflow aborts |
 | Any other value | Success; the value itself stored under `produces` |
 
+If a successful task value is an `Ecto.Multi`, it is still stored in `context`.
+It is merged into the returned `persist_multi` only when that `produces` name is
+listed in the workflow's `persists`.
+
 ## Handling emits
 
 After a workflow run, `emits` is a list of `{event_ref, payload}` tuples — one

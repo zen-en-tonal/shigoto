@@ -1,9 +1,9 @@
 # Persistence
 
 Shigoto separates domain logic from persistence. Domain functions produce
-*domain-valid change values* — changesets or maps of changesets. The executor
-collects these into an `Ecto.Multi` that the caller commits as a single
-transaction.
+*domain-valid change values* — changesets, maps of changesets, or transaction
+recipes. The executor collects declared `persists` values into an `Ecto.Multi`
+that the caller commits as a single transaction.
 
 ## The `persists` field
 
@@ -13,7 +13,7 @@ Declare which produced values should become DB operations:
 workflow do
   task :reserve_room do
     call {MyApp.Rooms, :reserve, [:rooms, :customer_id]}
-    produces :reservation        # returns a changeset or map of changesets
+    produces :reservation        # returns changesets, ChangesetLog, or Ecto.Multi
   end
 
   persists [:reservation]        # collected into the returned Ecto.Multi
@@ -36,10 +36,18 @@ After execution:
 | `%Shigoto.ChangesetLog{}` | Each entry expanded with indexed op keys `{key, 0}`, `{key, 1}`, … |
 | `%{name => changeset, ...}` (plain map) | Each entry expanded recursively |
 | `[changeset, ...]` (list) | Each entry expanded with indexed op keys |
+| `%Ecto.Multi{}` | Merged as-is with `Ecto.Multi.merge/2` |
 | Any other value | Skipped — no DB operation |
 
 Values produced by skipped nodes (non-taken decision branches) are never added
 to `persist_multi`.
+
+`Ecto.Multi` values are merged only when their `produces` name is listed in
+`persists`; otherwise they remain ordinary context values. Shigoto does not
+rewrite operation names inside a returned Multi, so the domain function should
+choose names that do not collide with other operations in the final transaction.
+If names collide, Ecto raises its normal duplicate operation error when the
+transaction is executed.
 
 ## `Shigoto.ChangesetLog`
 
@@ -125,6 +133,7 @@ persists [:log]
 | Chaining multiple domain operations across a workflow step | `ChangesetLog` |
 | Changesets use optimistic locking or prepare functions | `ChangesetLog` (directives preserved) |
 | You need the current entity state between operations | `ChangesetLog` + `project/2` |
+| You need `run`, `merge`, `insert_all`, `update_all`, or `delete_all` | `Ecto.Multi` |
 
 ## Maps and lists of changesets
 
@@ -154,6 +163,10 @@ Maps and lists can be arbitrarily nested — the executor recurses into them:
 ```
 
 Non-changeset entries in maps or lists are silently skipped.
+
+Maps and lists may also contain `Ecto.Multi` values. When the outer produced
+value is listed in `persists`, those Multi values are merged recursively using
+their existing operation names.
 
 ## Sub-workflow persists
 
@@ -196,9 +209,10 @@ impossible to:
 2. Test domain logic without a real database connection.
 3. Review what will be persisted before committing.
 
-By returning a changeset (or a map of changesets), the function remains a pure
-data transformation. The caller — the Shigoto executor — decides when and how to
-commit.
+By returning a changeset, a map of changesets, or an `Ecto.Multi`, the function
+does not execute the database write itself. The caller — the Shigoto executor —
+decides which produced values are committed and when to run the final
+transaction.
 
 ### Why use named maps instead of lists
 

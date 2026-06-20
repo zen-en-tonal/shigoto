@@ -34,7 +34,6 @@ Three top-level DSL constructs:
 - **`lib/shigoto/info.ex`** — Generated query API via `Spark.InfoGenerator`; use `Shigoto.Info.events/1`, `Shigoto.Info.workflows/1`, `Shigoto.Info.automations/1`.
 - **`lib/shigoto/ir.ex`** — `Shigoto.IR.build/1` converts a module into plain maps for downstream processing.
 - **`lib/shigoto/graph.ex`** — Builds a `%Shigoto.Graph{}` from a workflow struct; edges come from `after`, `requires`, `decision.branches`, and `emit` mappings. Used for cycle detection via Erlang `:digraph`/`:digraph_utils`. Prefer `with_digraph/2` over `to_digraph/1` to ensure cleanup.
-- **`lib/shigoto/multi.ex`** — Optional `Ecto.Multi` execution adapter (only compiled when Ecto is available). `Shigoto.Multi.new/4` and `from_automation/4` are the primary entry points.
 
 ### DSL Syntax
 
@@ -60,7 +59,7 @@ Within a workflow, two types of edges exist:
 - **Data dependency** — `requires:` pulls a value produced by a prior `task.produces`; the graph resolves producer nodes automatically.
 - **Control dependency** — `after:` (or `after_nodes:`) forces ordering without data flow.
 
-`decision` nodes use `branches:` to map result atoms to successor node names. `Shigoto.Multi` compiles branch descendants lazily via `Multi.merge`.
+`decision` nodes use `branches:` to map result atoms to successor node names. `Shigoto.Executor` evaluates only the selected branch.
 
 ### Verifiers
 
