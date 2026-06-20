@@ -33,6 +33,7 @@ After execution:
 |---|---|
 | `%Ecto.Changeset{data: %_{__meta__: %{state: :built}}}` | `Ecto.Multi.insert/3` |
 | `%Ecto.Changeset{}` (loaded state) | `Ecto.Multi.update/3` |
+| `%Shigoto.ChangesetLog{}` | Each entry expanded with indexed op keys `{key, 0}`, `{key, 1}`, … |
 | `%{name => changeset, ...}` (plain map) | Each entry expanded recursively |
 | `[changeset, ...]` (list) | Each entry expanded with indexed op keys |
 | Any other value | Skipped — no DB operation |
@@ -40,10 +41,14 @@ After execution:
 Values produced by skipped nodes (non-taken decision branches) are never added
 to `persist_multi`.
 
-## Maps and lists of changesets
+## `Shigoto.ChangesetLog`
 
-When a task produces multiple related changesets, return a plain map keyed by
-semantic name. The executor expands it into named `Ecto.Multi` operations:
+`Shigoto.ChangesetLog` is the primary abstraction for accumulating multiple
+changesets — potentially across different schemas — during a single workflow step.
+Each changeset is stored directly; all Ecto directives (`prepare`, `repo_opts`,
+`filters`, `constraints`, optimistic locks) are preserved with zero transformation.
+
+### Basic usage
 
 ```elixir
 defmodule MyApp.Rooms do
@@ -51,27 +56,90 @@ defmodule MyApp.Rooms do
     room_cs =
       room
       |> MyApp.Room.changeset(%{status: :reserved, customer_id: customer_id})
-      |> Ecto.Changeset.optimistic_lock(:updated_at)
+      |> Ecto.Changeset.optimistic_lock(:version)
 
     history_cs =
       %MyApp.Room.History{room_id: room.id}
       |> MyApp.Room.History.changeset(%{status: :reserved})
 
-    %{room: room_cs, history: history_cs}
+    room_cs
+    |> Shigoto.ChangesetLog.append(domain_op: :reserve)
+    |> Shigoto.ChangesetLog.append(history_cs, domain_op: :log_history)
   end
 end
 ```
 
-### Composing changeset maps
+The first call to `append/1-2` creates the log. The second call appends to it.
+`cs.data` is registered as the persistence anchor for its schema on first
+encounter — later changesets for the same schema do not overwrite it, so the
+original loaded entity (with primary key) is preserved for update operations.
 
-Use standard map operations to chain domain functions that pass changeset maps:
+### Chaining with `apply/3`
+
+`apply/3` is a shorthand for the project → domain function → fold-back pattern:
 
 ```elixir
-def reserve(%{room: _} = changes, customer_id) do
-  room = Ecto.Changeset.apply_changes(changes.room)
-  Map.merge(changes, reserve(room, customer_id))
+def reserve(%Shigoto.ChangesetLog{} = log, customer_id) do
+  Shigoto.ChangesetLog.apply(log, %MyApp.Room{}, fn current_room ->
+    reserve(current_room, customer_id)
+  end)
 end
 ```
+
+`apply/3` projects the log onto the base entity (replaying only entries for that
+schema), passes the result to the function, and folds the returned changeset(s)
+back into the log. The function may return a single `Ecto.Changeset`, a list, or
+a keyword list `[{atom, changeset}]` where the key becomes `domain_op`.
+
+### Projecting the current entity
+
+`project/2` replays entries for a specific schema onto a base entity:
+
+```elixir
+current_room = Shigoto.ChangesetLog.project(log, loaded_room)
+```
+
+`project/1` projects all schemas and returns a `%{module => entity}` map:
+
+```elixir
+%{MyApp.Room => current_room, MyApp.Room.History => current_history} =
+  Shigoto.ChangesetLog.project(log)
+```
+
+### Multi-schema logs
+
+A single `ChangesetLog` can accumulate changesets for multiple schemas. The
+executor expands each entry into an indexed `Ecto.Multi` operation:
+
+```elixir
+# log has 2 entries: MyApp.Room (insert) and MyApp.Room.History (insert)
+# → Multi ops: {:log, 0} and {:log, 1}
+persists [:log]
+```
+
+### When to use `ChangesetLog` vs plain maps
+
+| Situation | Recommended |
+|---|---|
+| Single domain function returns related changesets | Plain map `%{room: cs, history: cs}` |
+| Chaining multiple domain operations across a workflow step | `ChangesetLog` |
+| Changesets use optimistic locking or prepare functions | `ChangesetLog` (directives preserved) |
+| You need the current entity state between operations | `ChangesetLog` + `project/2` |
+
+## Maps and lists of changesets
+
+When a task produces multiple related changesets in a single function call,
+returning a plain map is the simplest option:
+
+```elixir
+def reserve(%{available: true, suggested: room}, customer_id) do
+  room_cs = MyApp.Room.changeset(room, %{status: :reserved, customer_id: customer_id})
+  history_cs = MyApp.Room.History.changeset(%MyApp.Room.History{room_id: room.id}, %{status: :reserved})
+  %{room: room_cs, history: history_cs}
+end
+```
+
+The executor expands each map entry into a named `Ecto.Multi` operation.
 
 ### Nested maps and lists
 
@@ -147,20 +215,29 @@ belongs as a business concern.
 
 ## Working with optimistic locking
 
-Plain changeset maps work naturally with Ecto's optimistic locking:
+Both plain maps and `ChangesetLog` preserve optimistic lock directives.
+`ChangesetLog` stores the full `Ecto.Changeset` struct, so `prepare` functions
+and `repo_opts` from `optimistic_lock` are automatically retained:
 
 ```elixir
 room_cs =
   room
   |> MyApp.Room.changeset(%{status: :reserved})
-  |> Ecto.Changeset.optimistic_lock(:lock_version)
+  |> Ecto.Changeset.optimistic_lock(:version)
 
+# Plain map:
 %{room: room_cs}
+
+# ChangesetLog (prepare function preserved, version not incremented until Repo.transaction):
+Shigoto.ChangesetLog.append(room_cs)
 ```
 
 Ecto will verify the lock version when `Repo.transaction(persist_multi)` runs.
 If another process updated the record between the domain call and the commit,
 the transaction fails with `Ecto.StaleEntryError`.
+
+`ChangesetLog.project/2` does not apply prepare functions — the version
+increment is a persistence concern and stays out of the projected entity state.
 
 ## Testing persists
 

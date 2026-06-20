@@ -152,7 +152,7 @@ DB operations, returned as an `Ecto.Multi` for the caller to commit:
 workflow do
   task :reserve do
     call {MyApp.Rooms, :reserve, [:rooms, :customer_id]}
-    produces :reservation         # returns a changeset or map of changesets
+    produces :reservation         # returns a changeset, map of changesets, or ChangesetLog
   end
 
   persists [:reservation]         # collected into the returned Ecto.Multi
@@ -161,6 +161,11 @@ end
 {:ok, ctx, persist_multi, _emits} = Shigoto.Executor.run(...)
 {:ok, _} = MyApp.Repo.transaction(persist_multi)
 ```
+
+`persists` values may be an `Ecto.Changeset`, a plain map of changesets, a list
+of changesets, or a `Shigoto.ChangesetLog`. `ChangesetLog` is the preferred form
+when a workflow step accumulates changesets across multiple schemas or needs to
+chain domain operations while preserving the intermediate entity state.
 
 ## What Shigoto validates at compile time
 
@@ -176,7 +181,7 @@ end
 
 - [DSL Reference](guides/dsl_reference.md) — complete syntax reference
 - [Executor](guides/executor.md) — running workflows with `Shigoto.Executor`
-- [Persistence](guides/persistence.md) — `persists` and changeset handling
+- [Persistence](guides/persistence.md) — `persists`, `ChangesetLog`, and changeset handling
 - [Automation](guides/automation.md) — routing emits with `Shigoto.Automation`
 - [Diagrams](guides/diagrams.md) — `mix shigoto.diagram`
 
