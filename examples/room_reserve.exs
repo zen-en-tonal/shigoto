@@ -148,12 +148,10 @@ defmodule MyApp.Rooms do
       iex> MyApp.Rooms.room_available?(%{status: :reserved})
       :not_available
   """
-  def room_available?(%{room: room_cs}) do
-    room_cs |> Ecto.Changeset.apply_changes() |> room_available?()
-  end
-
-  def room_available?(%Ecto.Changeset{} = changeset) do
-    room_available?(Ecto.Changeset.apply_changes(changeset))
+  def room_available?(%Shigoto.ChangesetLog{} = log) do
+    log 
+    |> Shigoto.ChangesetLog.project(%MyApp.Room{}) 
+    |> room_available?()
   end
 
   def room_available?(%{available: true}) do
@@ -186,13 +184,10 @@ defmodule MyApp.Rooms do
     reserve(room, customer_id)
   end
 
-  def reserve(%{room: _} = changes, customer_id) do
-    room = Ecto.Changeset.apply_changes(changes.room)
-    Map.merge(changes, reserve(room, customer_id))
-  end
-
-  def reserve(%Ecto.Changeset{} = changeset, customer_id) do
-    reserve(Ecto.Changeset.apply_changes(changeset), customer_id)
+  def reserve(%Shigoto.ChangesetLog{} = log, customer_id) do
+    Shigoto.ChangesetLog.apply(log, %MyApp.Room{}, fn room ->
+      reserve(room, customer_id)
+    end)
   end
 
   def reserve(%{status: :available} = room, customer_id) do
@@ -202,13 +197,13 @@ defmodule MyApp.Rooms do
         customer_id: customer_id, 
         status: :reserved, 
       })
-      |> Ecto.Changeset.optimistic_lock(:updated_at)
+      |> Ecto.Changeset.optimistic_lock(:version)
     
     history_changeset = 
       %MyApp.Room.History{room_id: room.id}
       |> MyApp.Room.History.changeset(%{status: :reserved})
 
-    %{room: room_changset, history: history_changeset}
+    [reserve: room_changset, logging: history_changeset]
   end
 
   def reserve(%{status: :reserved, customer_id: customer_id} = room, customer_id) do

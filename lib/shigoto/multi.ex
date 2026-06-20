@@ -205,6 +205,10 @@ if Code.ensure_loaded?(Ecto.Multi) do
       end)
     end
 
+    defp changeset_like_to_multi(%Shigoto.ChangesetLog{} = log, op, prefix) do
+      changeset_like_to_multi(Shigoto.ChangesetLog.to_changesets(log), op, prefix)
+    end
+
     defp changeset_like_to_multi(entries, _op, prefix)
          when is_map(entries) and not is_struct(entries) do
       Enum.reduce(entries, Multi.new(), fn {name, entry}, m ->

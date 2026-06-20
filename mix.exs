@@ -1,7 +1,7 @@
 defmodule Shigoto.MixProject do
   use Mix.Project
 
-  @version "0.2.0"
+  @version "0.3.0"
 
   def project do
     [
@@ -49,7 +49,7 @@ defmodule Shigoto.MixProject do
       ],
       groups_for_modules: [
         DSL: [Shigoto, Shigoto.Dsl],
-        Runtime: [Shigoto.Executor, Shigoto.Automation, Shigoto.Multi],
+        Runtime: [Shigoto.Executor, Shigoto.Automation, Shigoto.Multi, Shigoto.ChangesetLog],
         Export: [Shigoto.Export.Mermaid],
         "Internals & Query API": [Shigoto.Info, Shigoto.IR, Shigoto.Graph]
       ]

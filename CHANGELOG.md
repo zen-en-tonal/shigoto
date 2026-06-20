@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+
+- **`Shigoto.ChangesetLog`** — in-memory log of changesets accumulated during a
+  workflow execution. Stores each `Ecto.Changeset` directly, preserving all Ecto
+  directives (`changes`, `prepare`, `repo_opts`, `filters`, `constraints`) with
+  zero transformation.
+
+  Key API:
+  - `append(cs)` / `append(cs, opts)` — create a log from the first changeset;
+    `cs.data` becomes the persistence anchor for its schema.
+  - `append(log, cs)` / `append(log, cs, opts)` — append to an existing log;
+    auto-registers `cs.data` in `log.initial` on the first encounter per schema.
+  - `project(log, base)` — replay entries matching `base.__struct__` onto `base`;
+    returns the current entity. Entries for other schemas are ignored.
+  - `project(log)` — replay all schemas; returns `%{module => current_entity}`.
+  - `apply(log, base, fun)` — project → pure domain function → fold result
+    changesets back into the log. `fun` may return a single `Ecto.Changeset`,
+    a list, or a keyword list `[{atom, changeset}]` (key becomes `domain_op`).
+  - `to_changesets(log)` — returns the stored changesets in order; used by
+    `Shigoto.Executor` and `Shigoto.Multi` for persistence.
+
+  `log.initial` is `%{module() => struct()}` — multi-schema support, so a single
+  log can accumulate changesets for e.g. `Room` and `Room.History` in one pass.
+
+  A `ChangesetLog` may be returned from any task and listed in `persists`; the
+  executor expands it into indexed `Ecto.Multi` operations automatically.
+
+---
+
 ## 0.2.0
 
 ### Added
